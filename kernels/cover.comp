@@ -1,0 +1,146 @@
+// neuronte-gpu Vulkan compute kernel: the same algorithm as cover.cu.
+//
+// One workgroup evaluates one tile (workgroup x) for a group of GPB glyphs
+// (workgroup y): layers 2 to 4 are copied to shared memory, each glyph's
+// character part of layer 1 is computed into shared memory, then every
+// invocation takes one pixel at a time and evaluates its S x S samples.
+//
+// The hidden width H, the glyphs per workgroup, the workgroup size and where
+// the weights are read from are specialization constants, so one SPIR-V module
+// serves every model set.
+// EXACT (a preprocessor define, two modules) keeps the CPU library's operation
+// order with separately rounded multiplies and adds: `precise` forbids
+// contraction, and Vulkan requires add and multiply to be correctly rounded.
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef EXACT
+#define EXACT 1
+#endif
+
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const int H = 48;
+layout(constant_id = 2) const int GPB = 1;
+
+layout(std430, binding = 0) readonly buffer Params { float params[]; };
+layout(std430, binding = 1) readonly buffer Tiles { int tiles[]; };
+layout(std430, binding = 2) readonly buffer Masks { uint masks[]; };
+layout(std430, binding = 3) readonly buffer Scalars { uint scalars[]; };
+layout(std430, binding = 4) writeonly buffer Out { float outv[]; };
+
+layout(push_constant) uniform Push {
+    int nglyph;
+    int cell_w;
+    int cell_h;
+    int S;
+} pc;
+
+// Per-tile record in `tiles`. Must match the host (neuronte_gpu.c).
+const int T_X = 0, T_Y = 1, T_W = 2, T_H = 3, T_MASK = 4, T_PARAM = 5, T_XTAB = 6, T_YTAB = 7, T_MASKS = 8;
+const int T_INTS = 9;
+const int CODE = 64;
+const int NBITS = 21;
+const uint BRAILLE_FIRST = 0x2800u;
+
+// Layers 2 to 4: w2 [H][H], b2, w3 [H][H], b3, w4, b4, slope. WSHARED=1 copies
+// them to shared memory; WSHARED=0 reads them from the parameter buffer at
+// workgroup-uniform addresses, which some compilers (Mesa's Intel compiler)
+// turn into block loads that every invocation shares, and which has no shared
+// memory limit on H.
+layout(constant_id = 3) const int WSHARED = 0;
+shared float sm[1 + WSHARED * (2 * H * H + 3 * H + 1)];
+#define WT(i) (WSHARED != 0 ? sm[(i)] : params[pw + (i)])
+shared float cs[GPB * H];
+
+// EXACT: every value is `precise`, so no multiply and add is contracted into a
+// fused multiply-add (SPIR-V NoContraction; glslang also marks everything that
+// feeds a precise value). Otherwise the compiler may contract and reorder.
+#if EXACT
+#define PRECISE precise
+#else
+#define PRECISE
+#endif
+#define MAC(acc, a, b) ((acc) + (a) * (b))
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationID.x);
+    const int nt = int(gl_WorkGroupSize.x);
+    const int tb = int(gl_WorkGroupID.x) * T_INTS;
+    const int tx = tiles[tb + T_X], ty = tiles[tb + T_Y], tw = tiles[tb + T_W], th = tiles[tb + T_H];
+    const int mask = tiles[tb + T_MASK];
+    const int p = tiles[tb + T_PARAM], X = tiles[tb + T_XTAB], Y = tiles[tb + T_YTAB];
+    const int mk = tiles[tb + T_MASKS];
+    const int g0 = int(gl_WorkGroupID.y) * GPB;
+    const int nw = 2 * H * H + 3 * H + 2;
+    const int S = pc.S;
+
+    const int pw = p + (CODE + 1) * H;
+    if (WSHARED != 0)
+        for (int i = tid; i < nw; i += nt)
+            sm[i] = params[pw + i];
+    for (int k = tid; k < GPB * H; k += nt) {
+        int g = k / H, o = k - g * H, glyph = g0 + g;
+        if (glyph >= pc.nglyph)
+            break;
+        uint s = scalars[glyph];
+        if (mask >= 0)
+            s = BRAILLE_FIRST | ((s - BRAILLE_FIRST) & uint(mask));
+        if (s > 0x10FFFFu || (s >= 0xD800u && s <= 0xDFFFu))
+            s = 0xFFFDu;
+        PRECISE float c = params[p + CODE * H + o]; // b1
+        for (int i = 0; i < CODE; i++) {
+            uint bit = i < NBITS ? (s >> uint(i)) & 1u : uint(bitCount(s & masks[mk + i - NBITS]) & 1);
+            float w = params[p + i * H + o];
+            c = c + (bit != 0u ? w : -w); // (+-1) * w is exact
+        }
+        cs[k] = c;
+    }
+    barrier();
+
+    const int W2 = 0, B2 = H * H, W3 = H * H + H, B3 = 2 * H * H + H, W4 = 2 * H * H + 2 * H;
+    const float b4 = WT(2 * H * H + 3 * H), slope = WT(2 * H * H + 3 * H + 1);
+    const int P = tw * th;
+    const int plane = pc.cell_w * pc.cell_h;
+    // 1/(S*S) is exact for the sample counts the library uses (1, 2, 4, 8 per axis)
+    const float inv = 1.0 / float(S * S);
+
+    for (int it = tid; it < GPB * P; it += nt) {
+        int g = it / P, pi = it - g * P, glyph = g0 + g;
+        if (glyph >= pc.nglyph)
+            break;
+        int py = pi / tw, px = pi - py * tw;
+        int cb = g * H;
+        PRECISE float acc = 0.0;
+        for (int j = 0; j < S; j++) {
+            int yr = Y + (py * S + j) * H;
+            for (int i = 0; i < S; i++) {
+                int xr = X + (px * S + i) * H;
+                float a[H], b[H];
+                [[unroll]] for (int o = 0; o < H; o++) {
+                    PRECISE float v = (cs[cb + o] + params[xr + o]) + params[yr + o];
+                    a[o] = v > 0.0 ? v : 0.0;
+                }
+                [[unroll]] for (int o = 0; o < H; o++) {
+                    PRECISE float s2 = WT(B2 + o);
+                    [[unroll]] for (int q = 0; q < H; q++)
+                        s2 = MAC(s2, a[q], WT(W2 + o * H + q));
+                    b[o] = s2 > 0.0 ? s2 : 0.0;
+                }
+                [[unroll]] for (int o = 0; o < H; o++) {
+                    PRECISE float s3 = WT(B3 + o);
+                    [[unroll]] for (int q = 0; q < H; q++)
+                        s3 = MAC(s3, b[q], WT(W3 + o * H + q));
+                    a[o] = s3 > 0.0 ? s3 : 0.0;
+                }
+                PRECISE float f = b4;
+                [[unroll]] for (int o = 0; o < H; o++)
+                    f = MAC(f, WT(W4 + o), a[o]);
+                PRECISE float v = MAC(0.5, slope, f);
+                acc = acc + (v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v);
+            }
+        }
+        PRECISE float cover = acc * inv;
+        outv[glyph * plane + (ty + py) * pc.cell_w + tx + px] = cover;
+    }
+}

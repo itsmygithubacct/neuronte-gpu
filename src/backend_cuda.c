@@ -188,8 +188,10 @@ static int impl_run(void *p, const uint32_t *scalars, int count, float *out, str
     neuronte_gpu *g = m->g;
     size_t plane = (size_t)g->cell_w * g->cell_h, bytes = (size_t)count * plane * sizeof(float);
     unsigned groups = (unsigned)((count + g->gpb - 1) / g->gpb);
-    int gpb = g->gpb, cw = g->cell_w, ch = g->cell_h, s = g->samples;
-    void *args[] = {&m->d_params, &m->d_tiles, &m->d_masks, &m->d_scalars, &m->d_out, &count, &gpb, &cw, &ch, &s};
+    unsigned nz = (unsigned)neuronte_gpu_splits(g, g->ntiles * (int)groups);
+    int gpb = g->gpb, cw = g->cell_w, ch = g->cell_h, s = g->samples, per_sample = nz > 1;
+    void *args[] = {&m->d_params, &m->d_tiles, &m->d_masks, &m->d_scalars, &m->d_out, &count, &gpb, &cw, &ch, &s,
+                    &per_sample};
     uint64_t t0, t1, t2;
     float ms = 0;
     CUresult rc;
@@ -205,7 +207,7 @@ static int impl_run(void *p, const uint32_t *scalars, int count, float *out, str
     if (!rc)
         rc = cu->EventRecord(m->ev0, m->stream);
     if (!rc)
-        rc = cu->LaunchKernel(m->fn, (unsigned)g->ntiles, groups, 1, (unsigned)g->block, 1, 1, m->shared_bytes,
+        rc = cu->LaunchKernel(m->fn, (unsigned)g->ntiles, groups, nz, (unsigned)g->block, 1, 1, m->shared_bytes,
                               m->stream, args, NULL);
     if (!rc)
         rc = cu->EventRecord(m->ev1, m->stream);
@@ -277,6 +279,7 @@ int neuronte_gpu_cuda_open(neuronte_gpu *g, const struct neuronte_gpu_options *o
     cu->DeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
     cu->DeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
     cu->DeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+    g->fill_blocks = 2 * (sms > 0 ? sms : 1);
     cu->DeviceGetAttribute(&optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, dev);
     if ((rc = cu->CtxCreate(&m->ctx, 0, dev)) != 0) {
         neuronte_gpu_say(why, len, "cuCtxCreate: %s", err(cu, rc));

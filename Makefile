@@ -7,7 +7,9 @@
 #
 # CUDA kernels are PTX, made by clang's NVPTX target (no CUDA toolkit needed)
 # or by nvcc (PTXCC=nvcc); CUDA=0 builds without them. Vulkan kernels are
-# SPIR-V, made by glslc; VULKAN=0 builds without the Vulkan backend. The
+# SPIR-V, made by glslc; VULKAN=0 builds without the Vulkan backend, which is
+# the default when the Vulkan headers are not found (VULKAN_INCLUDE=DIR points
+# at a copy; only the headers are needed to build). The
 # driver libraries (libcuda.so.1, libvulkan.so.1) are loaded at run time with
 # dlopen, so the binary also runs, on the CPU path, where neither exists.
 
@@ -15,7 +17,11 @@ CC ?= cc
 CFLAGS ?= -O2
 NEURONTE_DIR ?= ../neuronte
 CUDA ?= 1
-VULKAN ?= 1
+VULKAN_INCLUDE ?=
+ifeq ($(origin VULKAN),undefined)
+VULKAN := $(shell printf '\043include <vulkan/vulkan.h>\n' | \
+    $(CC) $(if $(VULKAN_INCLUDE),-I$(VULKAN_INCLUDE)) -E -x c - >/dev/null 2>&1 && echo 1 || echo 0)
+endif
 PTXCC ?= clang
 PTX_ARCH ?= sm_50
 GLSLC ?= glslc
@@ -27,7 +33,7 @@ HIDDEN ?= 1 2 3 4 6 8 12 16 24 32 48 64
 WARN = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 # No contraction: the layer-1 tables are computed exactly as the reference library does.
 BASE = -std=c11 -ffp-contract=off
-CPPFLAGS += -Isrc -I$(NEURONTE_DIR)/include
+CPPFLAGS += -Isrc -I$(NEURONTE_DIR)/include $(if $(VULKAN_INCLUDE),-I$(VULKAN_INCLUDE))
 LDLIBS += $(NEURONTE_DIR)/build/libneuronte.a -ldl -lm -lpthread
 
 PTX = $(if $(filter 1,$(CUDA)),$(foreach h,$(HIDDEN),build/cover_h$(h).ptx))

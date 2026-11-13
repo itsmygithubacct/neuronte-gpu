@@ -421,16 +421,34 @@ void neuronte_gpu_set_block(neuronte_gpu *g, const struct neuronte_gpu_options *
     size_t h = (size_t)g->hidden;
 
     g->block = opt->block > 0 ? opt->block : dflt;
+    if (g->block < g->samples * g->samples) /* a block takes at least one pixel's samples per pass */
+        g->block = g->samples * g->samples;
     /* glyphs per block: enough work per block for the smallest tile */
-    for (t = 0; t < g->ntiles; t++)
+    g->max_tile_px = 0;
+    for (t = 0; t < g->ntiles; t++) {
         if (g->tiles[t].w * g->tiles[t].h < pmin)
             pmin = g->tiles[t].w * g->tiles[t].h;
+        if (g->tiles[t].w * g->tiles[t].h > g->max_tile_px)
+            g->max_tile_px = g->tiles[t].w * g->tiles[t].h;
+    }
     g->gpb = (2 * g->block + pmin - 1) / pmin;
     if (g->gpb < 1)
         g->gpb = 1;
     if (g->gpb > 64)
         g->gpb = 64;
-    g->pk.shared_floats = (int)(up4(2 * h * h + 3 * h + 2) + (size_t)g->gpb * h);
+    g->pk.shared_floats = (int)(up4(2 * h * h + 3 * h + 2) + (size_t)g->gpb * h + (size_t)g->block);
+}
+
+int neuronte_gpu_splits(const neuronte_gpu *g, int blocks)
+{
+    int nz, cap;
+    if (blocks <= 0 || blocks >= g->fill_blocks)
+        return 1;
+    nz = (g->fill_blocks + blocks - 1) / blocks;
+    cap = (g->gpb * g->max_tile_px * g->samples * g->samples + 31) / 32; /* at least 32 samples per block */
+    if (nz > cap)
+        nz = cap;
+    return nz < 1 ? 1 : nz;
 }
 
 /* ---- CPU path ---- */
@@ -539,6 +557,9 @@ int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out
     }
     if (!g->hidden)
         neuronte_gpu_say(why, sizeof why, "the tiles have different hidden widths");
+    else if ((int64_t)wmax * hmax * g->samples * g->samples * 64 > INT_MAX) /* 64 glyphs per block at most */
+        neuronte_gpu_say(why, sizeof why, "a %dx%d tile with %d samples per axis is too large for the GPU kernel",
+                         wmax, hmax, g->samples);
     else if (pack(g, why, sizeof why) == 0) {
         char w1[512] = "", w2[512] = "";
         int rc = -1;

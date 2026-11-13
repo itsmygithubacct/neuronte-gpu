@@ -352,7 +352,7 @@ static void impl_close(void *p)
 }
 
 struct push {
-    int32_t nglyph, cell_w, cell_h, samples;
+    int32_t nglyph, cell_w, cell_h, samples, per_sample;
 };
 
 static int impl_run(void *p, const uint32_t *scalars, int count, float *out, struct neuronte_gpu_timing *t)
@@ -361,7 +361,8 @@ static int impl_run(void *p, const uint32_t *scalars, int count, float *out, str
     struct vk *vk = &m->vk;
     neuronte_gpu *g = m->g;
     size_t plane = (size_t)g->cell_w * g->cell_h, bytes = (size_t)count * plane * sizeof(float);
-    struct push pc = {count, g->cell_w, g->cell_h, g->samples};
+    int groups = (count + g->gpb - 1) / g->gpb, nz = neuronte_gpu_splits(g, g->ntiles * groups);
+    struct push pc = {count, g->cell_w, g->cell_h, g->samples, nz > 1};
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     uint64_t t0, t1, t2, ts[2];
     struct buf *sb = &m->bufs[B_SCALARS], *ob = &m->bufs[B_OUT];
@@ -384,7 +385,7 @@ static int impl_run(void *p, const uint32_t *scalars, int count, float *out, str
     vk->CmdBindPipeline(m->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m->pipe);
     vk->CmdBindDescriptorSets(m->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m->layout, 0, 1, &m->set, 0, NULL);
     vk->CmdPushConstants(m->cmd, m->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
-    vk->CmdDispatch(m->cmd, (uint32_t)g->ntiles, (uint32_t)((count + g->gpb - 1) / g->gpb), 1);
+    vk->CmdDispatch(m->cmd, (uint32_t)g->ntiles, (uint32_t)groups, (uint32_t)nz);
     if (m->qpool)
         vk->CmdWriteTimestamp(m->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m->qpool, 1);
     {
@@ -442,14 +443,15 @@ int neuronte_gpu_vulkan_open(neuronte_gpu *g, const struct neuronte_gpu_options 
     VkQueueFamilyProperties fams[32];
     float prio = 1.0f;
     size_t plane = (size_t)g->cell_w * g->cell_h;
-    char driver[256] = "", denorm[64] = "";
+    char driver[2 * VK_MAX_DRIVER_NAME_SIZE + 2] = "", denorm[64] = "";
     const int wshared = (opt->flags & NEURONTE_GPU_SHARED_WEIGHTS) != 0;
     int shared_bytes;
 
     if (!m)
         return -1;
     neuronte_gpu_set_block(g, opt, 64); /* best on the Intel GPUs measured; 256 and up lose occupancy */
-    shared_bytes = (int)sizeof(float) * (wshared ? g->pk.shared_floats : 1 + g->gpb * g->hidden);
+    g->fill_blocks = 32; /* core Vulkan does not report compute units; enough for small GPUs */
+    shared_bytes = (int)sizeof(float) * (wshared ? g->pk.shared_floats : 1 + g->gpb * g->hidden + g->block);
     m->g = g;
     vk = &m->vk;
     for (i = 0; i < (uint32_t)neuronte_gpu_spirv_count; i++)
@@ -596,9 +598,9 @@ int neuronte_gpu_vulkan_open(neuronte_gpu *g, const struct neuronte_gpu_options 
         VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(struct push)};
         VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        int32_t spec_vals[4] = {g->block, g->hidden, g->gpb, wshared};
-        VkSpecializationMapEntry ents[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
-        VkSpecializationInfo spec = {4, ents, sizeof spec_vals, spec_vals};
+        int32_t spec_vals[5] = {g->block, g->hidden, g->gpb, wshared, g->block};
+        VkSpecializationMapEntry ents[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
+        VkSpecializationInfo spec = {5, ents, sizeof spec_vals, spec_vals};
         VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NBUF};
         VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};

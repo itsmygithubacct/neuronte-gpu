@@ -53,10 +53,12 @@ struct neuronte_gpu {
     int backend;
     char reason[512];
     char device[256];
-    char versions[256];
+    char versions[1024];
     const char *device_type;
     char name[256];
     int cell_w, cell_h, samples, hidden, ntiles, exact, gpb, block, max_batch;
+    int max_tile_px; /* pixels in the largest tile */
+    int fill_blocks; /* blocks a launch needs to occupy the device; set by the backend */
     int has_span;
     uint32_t span_first, span_last;
     struct gtile tiles[MAX_TILES];
@@ -89,6 +91,8 @@ struct embedded_spirv {
 extern const struct embedded_spirv neuronte_gpu_spirv[];
 extern const int neuronte_gpu_spirv_count;
 
+/* blocks along z for a launch of `blocks` blocks: more when the launch is too small to fill the device */
+int neuronte_gpu_splits(const neuronte_gpu *g, int blocks);
 /* sets block (opt->block, else dflt), glyphs per block and the shared memory a block needs */
 void neuronte_gpu_set_block(neuronte_gpu *g, const struct neuronte_gpu_options *opt, int dflt);
 void neuronte_gpu_say(char *buf, size_t len, const char *fmt, ...);

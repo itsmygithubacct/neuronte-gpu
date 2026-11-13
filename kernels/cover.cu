@@ -32,6 +32,8 @@
 #define NTID() ((int)__nvvm_read_ptx_sreg_ntid_x())
 #define CTAX() ((int)__nvvm_read_ptx_sreg_ctaid_x())
 #define CTAY() ((int)__nvvm_read_ptx_sreg_ctaid_y())
+#define CTAZ() ((int)__nvvm_read_ptx_sreg_ctaid_z())
+#define NCTAZ() ((int)__nvvm_read_ptx_sreg_nctaid_z())
 #define SYNC() __nvvm_bar_sync(0)
 #define ADD(a, b) __nvvm_add_rn_f((a), (b))
 #define MUL(a, b) __nvvm_mul_rn_f((a), (b))
@@ -46,6 +48,8 @@ typedef unsigned long size_t;
 #define NTID() ((int)blockDim.x)
 #define CTAX() ((int)blockIdx.x)
 #define CTAY() ((int)blockIdx.y)
+#define CTAZ() ((int)blockIdx.z)
+#define NCTAZ() ((int)gridDim.z)
 #define SYNC() __syncthreads()
 #define ADD(a, b) __fadd_rn((a), (b))
 #define MUL(a, b) __fmul_rn((a), (b))
@@ -93,10 +97,40 @@ static __device__ INLINE void dense(const float *w, const float *b, const float 
     }
 }
 
+/* One sample's clamped value: layers 1 (from the character part and the axis tables) to 4. */
+template <int EXACT>
+static __device__ INLINE float sample(const float *cg, const float *xr, const float *yr, const float *w, float b4,
+                                      float slope)
+{
+    const float *w2 = w, *b2 = w + H * H, *w3 = w + H * H + H, *b3 = w + 2 * H * H + H;
+    const float *w4 = w + 2 * H * H + 2 * H;
+    float a[H], b[H];
+#pragma unroll
+    for (int o = 0; o < H; o++) {
+        float x = ADD(ADD(cg[o], xr[o]), yr[o]);
+        a[o] = x > 0.0f ? x : 0.0f;
+    }
+    dense<EXACT>(w2, b2, a, b);
+    dense<EXACT>(w3, b3, b, a);
+    float f = b4;
+#pragma unroll
+    for (int o = 0; o < H; o++)
+        f = mac<EXACT>(f, w4[o], a[o]);
+    float v = mac<EXACT>(0.5f, slope, f);
+    return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
+
+/* A launch too small to fill the GPU (per_sample set by the host) gives each thread one sample, and
+ * a pass of the block ends in an ordered reduction, so one glyph spreads over many threads; a full
+ * launch gives each thread a pixel's samples in turn, which costs no barriers. Below this hidden
+ * width a pixel's chain is short and only the second form is compiled. */
+#define SAMPLE_ITEMS_H 16
+
 template <int EXACT>
 static __device__ INLINE void cover(const float *__restrict__ params, const int *__restrict__ tiles,
                                     const unsigned *__restrict__ masks, const unsigned *__restrict__ scalars,
-                                    float *__restrict__ out, int nglyph, int gpb, int cell_w, int cell_h, int S)
+                                    float *__restrict__ out, int nglyph, int gpb, int cell_w, int cell_h, int S,
+                                    int per_sample)
 {
     extern __shared__ ALIGN16 float sm[];
     const int *tl = tiles + CTAX() * T_INTS;
@@ -105,7 +139,8 @@ static __device__ INLINE void cover(const float *__restrict__ params, const int 
     const float *X = params + tl[T_XTAB], *Y = params + tl[T_YTAB];
     const unsigned *mk = masks + tl[T_MASKS];
     const int g0 = CTAY() * gpb;
-    /* shared: w2 [H][H], b2, w3 [H][H], b3, w4, b4, slope; then gpb character parts */
+    /* shared: w2 [H][H], b2, w3 [H][H], b3, w4, b4, slope; then gpb character parts; then a
+     * sample value per thread (per_sample) */
     const int nw = 2 * H * H + 3 * H + 2;
     float *C = sm + ((nw + 3) & ~3);
 
@@ -135,51 +170,77 @@ static __device__ INLINE void cover(const float *__restrict__ params, const int 
     const int P = tw * th;
     const size_t plane = (size_t)cell_w * (size_t)cell_h;
 
-    for (int it = TID(); it < gpb * P; it += NTID()) {
-        int g = it / P, pi = it - g * P, glyph = g0 + g;
-        if (glyph >= nglyph)
-            break;
-        int py = pi / tw, px = pi - py * tw;
-        const float *cg = C + g * H;
-        float acc = 0.0f;
-        for (int j = 0; j < S; j++) {
-            const float *yr = Y + (size_t)(py * S + j) * H;
-            for (int i = 0; i < S; i++) {
-                const float *xr = X + (size_t)(px * S + i) * H;
-                const float *w = (const float *)__builtin_assume_aligned(sm + opaque_zero(it * S * S + j * S + i), 16);
-                const float *w2 = w, *b2 = w + H * H, *w3 = w + H * H + H, *b3 = w + 2 * H * H + H;
-                const float *w4 = w + 2 * H * H + 2 * H;
-                float a[H], b[H];
-#pragma unroll
-                for (int o = 0; o < H; o++) {
-                    float v = ADD(ADD(cg[o], xr[o]), yr[o]);
-                    a[o] = v > 0.0f ? v : 0.0f;
+    /* Blocks along z share out the pixels of one tile and glyph group, so a call with too few glyphs
+     * still fills the GPU. */
+    const int SS = S * S;
+    const int pixels = gpb * P, pchunk = (pixels + NCTAZ() - 1) / NCTAZ();
+    const int plo = CTAZ() * pchunk;
+    int phi = plo + pchunk;
+    if (phi > pixels)
+        phi = pixels;
+    if (nglyph - g0 < gpb && phi > (nglyph - g0) * P) /* the last group may be partly empty */
+        phi = (nglyph - g0) * P;
+    if (H >= SAMPLE_ITEMS_H && per_sample) {
+        /* One item is one sample: (glyph, pixel, sub-row, sub-column), in that order. Each pass of
+         * the block takes `per` consecutive items, a whole number of pixels; the samples' values
+         * meet in shared memory and one thread per pixel adds them in the library's order. */
+        const int per = NTID() / SS * SS, lo = plo * SS, hi = phi * SS;
+        float *V = C + gpb * H; /* one sample value per thread */
+        for (int base = lo; base < hi; base += per) {
+            const int it = base + TID();
+            const bool on = TID() < per && it < hi;
+            const int pix = it / SS, sub = it - pix * SS;
+            const int g = pix / P, pi = pix - g * P;
+            const int py = pi / tw, px = pi - py * tw;
+            float v = 0.0f;
+            if (on) {
+                const int j = sub / S, i = sub - j * S;
+                v = sample<EXACT>(C + g * H, X + (size_t)(px * S + i) * H, Y + (size_t)(py * S + j) * H,
+                                  (const float *)__builtin_assume_aligned(sm + opaque_zero(it), 16), b4, slope);
+            }
+            float *dst = out + (size_t)(g0 + g) * plane + (size_t)(ty + py) * cell_w + tx + px;
+            if (SS == 1) {
+                if (on)
+                    *dst = DIV(ADD(0.0f, v), ss);
+            } else {
+                V[TID()] = v;
+                SYNC();
+                if (on && sub == 0) {
+                    float acc = 0.0f;
+                    for (int k = 0; k < SS; k++)
+                        acc = ADD(acc, V[TID() + k]);
+                    *dst = DIV(acc, ss);
                 }
-                dense<EXACT>(w2, b2, a, b);
-                dense<EXACT>(w3, b3, b, a);
-                float f = b4;
-#pragma unroll
-                for (int o = 0; o < H; o++)
-                    f = mac<EXACT>(f, w4[o], a[o]);
-                float v = mac<EXACT>(0.5f, slope, f);
-                acc = ADD(acc, v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v);
+                SYNC();
             }
         }
-        out[(size_t)glyph * plane + (size_t)(ty + py) * cell_w + tx + px] = DIV(acc, ss);
+    } else {
+        for (int pix = plo + TID(); pix < phi; pix += NTID()) {
+            const int g = pix / P, pi = pix - g * P;
+            const int py = pi / tw, px = pi - py * tw;
+            float acc = 0.0f;
+            for (int j = 0; j < S; j++)
+                for (int i = 0; i < S; i++)
+                    acc = ADD(acc, sample<EXACT>(C + g * H, X + (size_t)(px * S + i) * H, Y + (size_t)(py * S + j) * H,
+                                                 (const float *)__builtin_assume_aligned(
+                                                     sm + opaque_zero(pix * SS + j * S + i), 16),
+                                                 b4, slope));
+            out[(size_t)(g0 + g) * plane + (size_t)(ty + py) * cell_w + tx + px] = DIV(acc, ss);
+        }
     }
 }
 
 #define ARGS                                                                                             \
     const float *__restrict__ params, const int *__restrict__ tiles, const unsigned *__restrict__ masks, \
         const unsigned *__restrict__ scalars, float *__restrict__ out, int nglyph, int gpb, int cell_w,  \
-        int cell_h, int S
+        int cell_h, int S, int per_sample
 
 extern "C" __global__ void neuronte_cover_exact(ARGS)
 {
-    cover<1>(params, tiles, masks, scalars, out, nglyph, gpb, cell_w, cell_h, S);
+    cover<1>(params, tiles, masks, scalars, out, nglyph, gpb, cell_w, cell_h, S, per_sample);
 }
 
 extern "C" __global__ void neuronte_cover_fast(ARGS)
 {
-    cover<0>(params, tiles, masks, scalars, out, nglyph, gpb, cell_w, cell_h, S);
+    cover<0>(params, tiles, masks, scalars, out, nglyph, gpb, cell_w, cell_h, S, per_sample);
 }

@@ -21,6 +21,7 @@
 layout(local_size_x_id = 0) in;
 layout(constant_id = 1) const int H = 48;
 layout(constant_id = 2) const int GPB = 1;
+layout(constant_id = 4) const int NB = 64; // the workgroup size again, to size sv
 
 layout(std430, binding = 0) readonly buffer Params { float params[]; };
 layout(std430, binding = 1) readonly buffer Tiles { int tiles[]; };
@@ -33,6 +34,7 @@ layout(push_constant) uniform Push {
     int cell_w;
     int cell_h;
     int S;
+    int per_sample; // the launch is too small to fill the GPU: one invocation per sample
 } pc;
 
 // Per-tile record in `tiles`. Must match the host (neuronte_gpu.c).
@@ -51,6 +53,7 @@ layout(constant_id = 3) const int WSHARED = 0;
 shared float sm[1 + WSHARED * (2 * H * H + 3 * H + 1)];
 #define WT(i) (WSHARED != 0 ? sm[(i)] : params[pw + (i)])
 shared float cs[GPB * H];
+shared float sv[NB]; // one sample value per invocation
 
 // EXACT: every value is `precise`, so no multiply and add is contracted into a
 // fused multiply-add (SPIR-V NoContraction; glslang also marks everything that
@@ -61,6 +64,42 @@ shared float cs[GPB * H];
 #define PRECISE
 #endif
 #define MAC(acc, a, b) ((acc) + (a) * (b))
+
+// Offsets of layers 2 to 4 in the weight block (shared memory or the parameter buffer).
+const int W2 = 0, B2 = H * H, W3 = H * H + H, B3 = 2 * H * H + H, W4 = 2 * H * H + 2 * H;
+
+// One sample's clamped value: layers 1 (character part at cs[cb], axis rows at xr, yr) to 4.
+float sample_value(int pw, int cb, int xr, int yr, float b4, float slope)
+{
+    float a[H], b[H];
+    [[unroll]] for (int o = 0; o < H; o++) {
+        PRECISE float x = (cs[cb + o] + params[xr + o]) + params[yr + o];
+        a[o] = x > 0.0 ? x : 0.0;
+    }
+    [[unroll]] for (int o = 0; o < H; o++) {
+        PRECISE float s2 = WT(B2 + o);
+        [[unroll]] for (int q = 0; q < H; q++)
+            s2 = MAC(s2, a[q], WT(W2 + o * H + q));
+        b[o] = s2 > 0.0 ? s2 : 0.0;
+    }
+    [[unroll]] for (int o = 0; o < H; o++) {
+        PRECISE float s3 = WT(B3 + o);
+        [[unroll]] for (int q = 0; q < H; q++)
+            s3 = MAC(s3, b[q], WT(W3 + o * H + q));
+        a[o] = s3 > 0.0 ? s3 : 0.0;
+    }
+    PRECISE float f = b4;
+    [[unroll]] for (int o = 0; o < H; o++)
+        f = MAC(f, WT(W4 + o), a[o]);
+    PRECISE float v = MAC(0.5, slope, f);
+    return v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v;
+}
+
+// A launch too small to fill the GPU (pc.per_sample) gives each invocation one sample, and a pass
+// of the workgroup ends in an ordered reduction, so one glyph spreads over many invocations; a
+// full launch gives each invocation a pixel's samples in turn, which costs no barriers. Below this
+// hidden width a pixel's chain is short and only the second form is used.
+const int SAMPLE_ITEMS_H = 16;
 
 void main()
 {
@@ -98,49 +137,63 @@ void main()
     }
     barrier();
 
-    const int W2 = 0, B2 = H * H, W3 = H * H + H, B3 = 2 * H * H + H, W4 = 2 * H * H + 2 * H;
     const float b4 = WT(2 * H * H + 3 * H), slope = WT(2 * H * H + 3 * H + 1);
     const int P = tw * th;
     const int plane = pc.cell_w * pc.cell_h;
     // 1/(S*S) is exact for the sample counts the library uses (1, 2, 4, 8 per axis)
     const float inv = 1.0 / float(S * S);
 
-    for (int it = tid; it < GPB * P; it += nt) {
-        int g = it / P, pi = it - g * P, glyph = g0 + g;
-        if (glyph >= pc.nglyph)
-            break;
-        int py = pi / tw, px = pi - py * tw;
-        int cb = g * H;
-        PRECISE float acc = 0.0;
-        for (int j = 0; j < S; j++) {
-            int yr = Y + (py * S + j) * H;
-            for (int i = 0; i < S; i++) {
-                int xr = X + (px * S + i) * H;
-                float a[H], b[H];
-                [[unroll]] for (int o = 0; o < H; o++) {
-                    PRECISE float v = (cs[cb + o] + params[xr + o]) + params[yr + o];
-                    a[o] = v > 0.0 ? v : 0.0;
+    // Workgroups along z share out the pixels of one tile and glyph group, so a call with too few
+    // glyphs still fills the GPU.
+    const int SS = S * S;
+    const int pixels = GPB * P, nz = int(gl_NumWorkGroups.z), pchunk = (pixels + nz - 1) / nz;
+    const int plo = int(gl_WorkGroupID.z) * pchunk;
+    const int phi = min(min(plo + pchunk, pixels), min(pc.nglyph - g0, GPB) * P);
+    if (H >= SAMPLE_ITEMS_H && pc.per_sample != 0) {
+        // One item is one sample: (glyph, pixel, sub-row, sub-column), in that order. Each pass of
+        // the workgroup takes `per` consecutive items, a whole number of pixels; the samples' values
+        // meet in shared memory and one invocation per pixel adds them in the library's order.
+        const int per = nt / SS * SS, hi = phi * SS;
+        for (int base = plo * SS; base < hi; base += per) {
+            const int it = base + tid;
+            const bool on = tid < per && it < hi;
+            const int pix = it / SS, sub = it - pix * SS;
+            const int g = pix / P, pi = pix - g * P;
+            const int py = pi / tw, px = pi - py * tw;
+            float v = 0.0;
+            if (on) {
+                const int j = sub / S, i = sub - j * S;
+                v = sample_value(pw, g * H, X + (px * S + i) * H, Y + (py * S + j) * H, b4, slope);
+            }
+            const int dst = (g0 + g) * plane + (ty + py) * pc.cell_w + tx + px;
+            if (SS == 1) {
+                if (on) {
+                    PRECISE float cover = (0.0 + v) * inv;
+                    outv[dst] = cover;
                 }
-                [[unroll]] for (int o = 0; o < H; o++) {
-                    PRECISE float s2 = WT(B2 + o);
-                    [[unroll]] for (int q = 0; q < H; q++)
-                        s2 = MAC(s2, a[q], WT(W2 + o * H + q));
-                    b[o] = s2 > 0.0 ? s2 : 0.0;
+            } else {
+                sv[tid] = v;
+                barrier();
+                if (on && sub == 0) {
+                    PRECISE float acc = 0.0;
+                    for (int k = 0; k < SS; k++)
+                        acc = acc + sv[tid + k];
+                    PRECISE float cover = acc * inv;
+                    outv[dst] = cover;
                 }
-                [[unroll]] for (int o = 0; o < H; o++) {
-                    PRECISE float s3 = WT(B3 + o);
-                    [[unroll]] for (int q = 0; q < H; q++)
-                        s3 = MAC(s3, b[q], WT(W3 + o * H + q));
-                    a[o] = s3 > 0.0 ? s3 : 0.0;
-                }
-                PRECISE float f = b4;
-                [[unroll]] for (int o = 0; o < H; o++)
-                    f = MAC(f, WT(W4 + o), a[o]);
-                PRECISE float v = MAC(0.5, slope, f);
-                acc = acc + (v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v);
+                barrier();
             }
         }
-        PRECISE float cover = acc * inv;
-        outv[glyph * plane + (ty + py) * pc.cell_w + tx + px] = cover;
+    } else {
+        for (int pix = plo + tid; pix < phi; pix += nt) {
+            const int g = pix / P, pi = pix - g * P;
+            const int py = pi / tw, px = pi - py * tw;
+            PRECISE float acc = 0.0;
+            for (int j = 0; j < S; j++)
+                for (int i = 0; i < S; i++)
+                    acc = acc + sample_value(pw, g * H, X + (px * S + i) * H, Y + (py * S + j) * H, b4, slope);
+            PRECISE float cover = acc * inv;
+            outv[(g0 + g) * plane + (ty + py) * pc.cell_w + tx + px] = cover;
+        }
     }
 }

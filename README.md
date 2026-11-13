@@ -243,9 +243,9 @@ Notes:
 - Fast mode gains little on Mali. On the G610, letting the compiler fuse
   multiply-adds (by `mad` or by contraction) makes it spill the per-sample
   kernel's registers (448 private bytes at H = 12, none in exact mode), up
-  to 8 times slower; with the tile kernel (H = 48) it is 4 to 10% faster.
-  On the T860 its output was identical to exact mode's (its `mad` evidently
-  rounds the product) and no faster. Use exact mode on Mali.
+  to 8 times slower; with the tile kernel (H = 48) it is 3 to 11% faster.
+  On the T860 its output was identical to exact mode's, and it was no
+  faster. Use exact mode on Mali.
 
 ## Limits
 

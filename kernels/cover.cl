@@ -1,28 +1,40 @@
-/* neuronte-gpu OpenCL kernel (OpenCL C 1.2): the algorithm of cover.comp, arranged for GPUs with
+/* neuronte-gpu OpenCL kernels (OpenCL C 1.2): the algorithm of cover.comp, arranged for GPUs with
  * few registers per work-item and 4-wide vector arithmetic, such as Arm Mali.
  *
- * One work-group evaluates one tile (group x) for a group of `gpb` glyphs (group y); groups along
- * z share out the pixels of a launch too small to fill the GPU. The character part of layer 1 of
- * the group's glyphs is computed into local memory first. Then each work-item takes one pixel at
- * a time and evaluates its S x S samples in order or, in small launches with a hidden width of 16
- * or more (`per_sample`), one sample at a time, the samples of a pixel meeting in local memory to
- * be added in order by one work-item.
+ * Both kernels share the layout of the Vulkan one. One work-group evaluates one tile (group x) for
+ * a group of `gpb` glyphs (group y); groups along z share out the pixels of a launch too small to
+ * fill the GPU. The character part of layer 1 of the group's glyphs is computed into local memory
+ * first. The host chooses the kernel by hidden width and device (backend_opencl.c).
  *
- * A sample keeps only H values live per work-item. Layer 2 is evaluated one input at a time: each
- * layer-1 activation is formed when it is needed (two additions and a ReLU, from the character
- * part and the x and y tables) and added into all H layer-2 sums, which is also the order the
- * reference library uses. Layer 3 is evaluated four outputs at a time from the H layer-2
- * activations, and each output is added into layer 4 as soon as it is known. Weights are stored
- * [input][output] with rows padded to a multiple of four, so four outputs' weights are one 16-byte
- * load and the arithmetic is on 4-vectors, which Midgard executes natively.
+ * cover, the per-sample kernel: each work-item takes one pixel at a time and evaluates its S x S
+ * samples in order or, in small launches with a hidden width of 16 or more (`per_sample`), one
+ * sample at a time, the samples of a pixel meeting in local memory to be added in order by one
+ * work-item. A sample keeps only H values live per work-item. Layer 2 is evaluated one input at a
+ * time: each layer-1 activation is formed when it is needed (two additions and a ReLU, from the
+ * character part and the x and y tables) and added into all H layer-2 sums, which is also the
+ * order the reference library uses. Layer 3 is evaluated four outputs at a time from the H layer-2
+ * activations, and each output is added into layer 4 as soon as it is known.
  *
- * Every sum adds its terms in the reference library's order. With EXACT, every multiply and add
- * is rounded separately (FP_CONTRACT OFF), so the coverage is the library's bit for bit wherever
- * the device's single-precision add and multiply are correctly rounded and keep denormals.
+ * cover_tile, the tile kernel: the work-group evaluates NS samples at a time, layer by layer,
+ * through local memory. Layers 2 and 3 are matrix products in which each work-item computes
+ * blocks of 4 outputs x 4 samples, so one weight load and one activation load feed four vector
+ * multiply-adds. It does more arithmetic per load than the per-sample kernel and keeps fewer
+ * registers live, which pays at large hidden widths.
+ *
+ * Weights are stored [input][output] with rows padded to a multiple of four, so four outputs'
+ * weights are one 16-byte load and the arithmetic is on 4-vectors, which Midgard executes natively.
+ *
+ * Every sum adds its terms in the reference library's order. (The library skips terms whose input
+ * is zero; adding them can change only the sign of a zero sum, which the ReLU discards.) With
+ * EXACT, every multiply and add is rounded separately (FP_CONTRACT OFF), so the coverage is the
+ * library's bit for bit wherever the device's single-precision add and multiply are correctly
+ * rounded and keep denormals.
  *
  * Compile-time definitions: H (hidden width), S (samples per axis), EXACT (0 or 1), HOST_DIVIDE
  * (1 when S*S is not a power of two: the kernel writes the sums and the host divides them, since
- * the device's division need not be correctly rounded and 1/(S*S) is then not exact).
+ * the device's division need not be correctly rounded and 1/(S*S) is then not exact); optionally
+ * L3B (per-sample kernel: layer-3 output blocks per pass, default 1), NS (tile kernel: samples per
+ * pass, default 64) and TO (tile kernel: output blocks per work-item, 1 or 2, default 1).
  */
 #ifndef H
 #error H (the hidden width) must be defined

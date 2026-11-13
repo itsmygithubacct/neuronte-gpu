@@ -12,6 +12,172 @@ goal is a GPU path that is faster than the CPU library on the same machine.
 
 Development happens on the `work/rc9-gpu` branch, for the RC9 release.
 
+## Results
+
+Measured on 2026-11-13 against the reference CPU library (Neuronte
+`a6b8508`, built with its own flags on the same machine), over 16 Braille
+model sets (one network of hidden width 48, up to 48 tiles of width 1) at
+8×16, 16×32 and 48×96 pixels: 48 configurations, 256 glyphs per call, end to
+end (upload, kernel, download, copy to the caller), back to back with the CPU
+on the same machine.
+
+| GPU | API | CPU of the same machine | × one CPU core (min / median / max) | × all CPU threads at once | single glyph × one core | output |
+|---|---|---|---|---|---|---|
+| GeForce RTX 3070 | CUDA | Core i7-10700F | 53 / 218 / 350 | 5.7 / 21 / 38 (16 threads) | 2.1 / 9.2 / 23 | byte-identical, 48 of 48 |
+| Quadro RTX 3000 (laptop) | CUDA | Core i7-9850H | 47 / 212 / 1,058 | 3.9 / 22 / 60 (12 threads) | 2.0 / 9.6 / 41 | byte-identical, 48 of 48 |
+| Quadro M2000M (laptop) | CUDA | Core i7-6820HQ | 9.9 / 48 / 189 | 2.3 / 11 / 45 (8 threads) | 1.8 / 6.4 / 13 | byte-identical, 48 of 48 |
+| UHD Graphics 630 (laptop) | Vulkan | Core i7-9850H | 6.5 / 22 / 136 | 0.9 / 2.4 / 8.4 (12 threads) | 0.3 / 1.5 / 7.0 | byte-identical, 48 of 48 |
+
+The library itself is single-threaded per call; "all CPU threads" runs one
+CPU process per hardware thread at once and adds their rates. The RTX 3000
+laptop's CPU figures were taken under load from other work, which inflates
+its ratios. The integrated GPU stays at its lowest clock for short, spaced
+single-glyph calls, so for small models a single glyph is faster on the CPU
+there; batched, it is faster than one core in every configuration and faster
+than the whole CPU in 46 of 48.
+
+## What it computes
+
+A Neuronte distance network maps a position in the cell and the code of a
+character to a signed distance: 90 inputs (26 position features, 64 code
+features), three hidden layers of width H with ReLU, one output. The library
+supersamples each pixel (2 × 2 below a 24 px cell width, otherwise 1), turns
+each output into coverage with a clamped ramp and averages the samples.
+
+neuronte-gpu evaluates a *model set*: one network over the whole cell, or
+several networks ("tiles") that each draw a rectangle of the cell, as in the
+Braille spatial-split experiments. Each tile is evaluated on its own local
+grid with the scalar masked to the dots it draws, exactly as calling
+`neuronte_coverage` per tile does. The result of one call is the coverage of
+a batch of scalars, one raster per scalar.
+
+## How it works
+
+- **Precomputed layer 1.** Layer 1 is linear in the inputs, so it splits
+  into a part that depends on the character (64 code features, computed once
+  per glyph and tile on the GPU) and parts that depend on x and on y alone
+  (computed once at open for every sample column and row of each tile, in
+  double precision and rounded to float, exactly as the library does). A
+  sample's layer 1 is then two additions and a ReLU.
+- **One kernel for every model set.** A launch covers all tiles (grid x),
+  groups of glyphs (grid y) and, when a call is too small to fill the GPU,
+  slices of each tile's pixels (grid z). A block copies layers 2 to 4 into
+  shared memory (or, on Vulkan, reads them from the parameter buffer at
+  uniform addresses, which Intel's compiler turns into shared block loads),
+  computes the character parts of its glyphs, then evaluates samples. For
+  hidden widths of 24 and up one thread takes one sample and the samples of a
+  pixel are added in a fixed order through shared memory; for narrower
+  networks one thread takes a whole pixel.
+- **CUDA without the CUDA toolkit.** The kernel is compiled to PTX by clang's
+  NVPTX target (or by nvcc) for every supported hidden width, embedded in the
+  library, and loaded through the driver library (`libcuda.so.1`) with
+  `dlopen`; the driver compiles it for the GPU on first use and caches it.
+- **Vulkan compute.** The same algorithm in GLSL, compiled to SPIR-V by
+  glslc and embedded; the hidden width, workgroup size and weight source are
+  specialization constants, so one module serves every model set. The Vulkan
+  loader (`libvulkan.so.1`) is also opened with `dlopen`, so one binary runs
+  on machines with either, both or neither.
+
+## Exactness
+
+By default the GPU uses the CPU library's operation order with separately
+rounded multiplies and adds (CUDA `__fmul_rn`/`__fadd_rn`; GLSL `precise`,
+which forbids contraction into fused multiply-adds). Its coverage then
+matches the library's bit for bit wherever both round IEEE single precision
+the same way, which held for every model set, cell size and GPU measured.
+`NEURONTE_GPU_FAST` (bench `--fast`) allows fused multiply-adds; the largest
+difference from the CPU measured with it is below 1e-5 and no pixel crossed
+0.5. It gains little (a median 1.1× on the GPUs measured, most for wide
+networks); on the Intel GPU measured it is slower than exact mode at H=48.
+
+## Building
+
+```sh
+make NEURONTE_DIR=/path/to/neuronte
+```
+
+`NEURONTE_DIR` must contain `include/neuronte.h` and `build/libneuronte.a`
+(the reference CPU library, used for the CPU path and the fallback). The build
+needs a C11 compiler and Python 3; making the kernels needs clang with the
+NVPTX target (or `PTXCC=nvcc`) and glslc. Generated kernels in `build/` are
+reused, so a machine without clang or glslc can build from a copy of them.
+The Vulkan backend is built when the Vulkan headers are found
+(`VULKAN_INCLUDE=DIR` points at a copy; `VULKAN=0` leaves it out). `CUDA=0`
+leaves out the CUDA kernels; `HIDDEN="4 12 48"` limits the widths compiled
+(default 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64).
+
+Outputs: `build/libneuronte_gpu.a` and `build/neuronte_gpu_bench`.
+
+## Using it
+
+```c
+#include "neuronte_gpu.h"
+
+struct neuronte_gpu_options opt = {0};
+opt.nrt_path = "braille48.nrt";     /* or opt.layout_path = "split.layout" */
+opt.cell_w = 16;
+opt.cell_h = 32;
+opt.flags = NEURONTE_GPU_ALLOW_FALLBACK;
+neuronte_gpu *g;
+char why[512];
+if (neuronte_gpu_open(&opt, &g, why, sizeof why) == 0) {
+    float out[256 * 16 * 32];
+    neuronte_gpu_coverage(g, scalars, 256, out, NULL);
+    printf("%s on %s\n", neuronte_gpu_backend_name(neuronte_gpu_backend(g)), neuronte_gpu_device(g));
+    neuronte_gpu_close(g);
+}
+```
+
+The backend is chosen at open: CUDA, then Vulkan (`NEURONTE_GPU_AUTO`), or
+the one requested. A Vulkan device that is a CPU (lavapipe) is refused unless
+`NEURONTE_GPU_ALLOW_CPU_DEVICE` is given, and is then reported as such. When
+no GPU can be used, open fails with the reason, or with
+`NEURONTE_GPU_ALLOW_FALLBACK` returns a handle on the reference CPU library
+labelled `cpu-fallback`, with the reason in `neuronte_gpu_fallback_reason`.
+The backend, device, driver versions and device type are always reported.
+
+A layout file describes a model set (`tools/layout.py` writes one per case
+and cell size from a Braille experiment manifest):
+
+```
+neuronte-gpu-layout 1
+name quadrants12-s0
+cell 16 32
+tile 3 0 0 8 16 top-left-s0.nrt
+tile 24 8 0 8 16 top-right-s0.nrt
+tile 68 0 16 8 16 bottom-left-s0.nrt
+tile 160 8 16 8 16 bottom-right-s0.nrt
+```
+
+Each `tile` line is `MASK X Y W H FILE` (MASK -1 passes the scalar through).
+A bundle `.nrt` is resolved to the member its range table routes the
+layout's `span` to; scalars outside the span are drawn by the CPU library.
+
+### The benchmark
+
+```sh
+build/neuronte_gpu_bench --nrt braille48.nrt --cell 16x32 --backend cuda \
+    --cpu 2 --warmup-ms 1000 --warmup 2 --repeats 9 --passes 4 --single 64 \
+    --coverage-out cuda.f32 > cuda.json
+build/neuronte_gpu_bench --nrt braille48.nrt --cell 16x32 --backend cpu \
+    --cpu 2 --repeats 9 --passes 4 --single 64 --coverage-out cpu.f32 > cpu.json
+cmp cuda.f32 cpu.f32
+```
+
+One process measures one backend: open, the first call, a timed warmup
+(GPU clocks ramp up), warmup rounds, measured rounds of `--passes` calls of
+the 256 Braille scalars in a shuffled order, and `--single` one-glyph calls.
+Every round is written to the JSON output with its stage times and hardware
+snapshots (CPU frequency, load, temperatures, Intel GPU frequency and NVIDIA
+clocks, power and utilisation) at start, at the start of measurement and at
+the end. The coverage dump is in scalar order, for comparison with the CPU.
+
+## Limits
+
+- One hidden width per model set on the GPU (mixed widths use the CPU).
+- CUDA: the compiled hidden widths; Vulkan: hidden widths up to 64.
+- Compute capability 5.0 or later for CUDA; Vulkan 1.1 for Vulkan.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

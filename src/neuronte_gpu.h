@@ -30,7 +30,8 @@ extern "C" {
 typedef struct neuronte_gpu neuronte_gpu;
 
 enum neuronte_gpu_backend {
-    NEURONTE_GPU_AUTO = 0,         /* request: CUDA, then Vulkan, then OpenCL */
+    NEURONTE_GPU_AUTO = 0,         /* request: CUDA, then Vulkan, then OpenCL; where Arm's kernel
+                                    * driver is present (/dev/mali0), OpenCL before Vulkan */
     NEURONTE_GPU_CUDA = 1,         /* inference on an NVIDIA GPU through CUDA */
     NEURONTE_GPU_VULKAN = 2,       /* inference through Vulkan compute */
     NEURONTE_GPU_CPU_FALLBACK = 3, /* no usable GPU: the reference CPU library */

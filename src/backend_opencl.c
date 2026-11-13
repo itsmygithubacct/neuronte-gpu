@@ -442,6 +442,9 @@ int neuronte_gpu_opencl_open(neuronte_gpu *g, const struct neuronte_gpu_options 
     g->impl = m;
     return 0;
 fail:
+    /* leave no trace of this device for a backend tried next, or for a CPU fallback's report */
+    g->device[0] = 0;
+    g->device_type = "";
     free(params);
     free(src_file);
     impl_close(m);

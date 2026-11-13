@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define HEADER (8 + 5 * 4 + 4 + NMASK * 4)
 #define BUNDLE_HEAD 28
@@ -564,17 +565,26 @@ int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out
     else if (pack(g, why, sizeof why) == 0) {
         char w1[512] = "", w2[512] = "", w3[512] = "";
         int rc = -1;
+        /* Arm's kernel driver (kbase, /dev/mali0) comes with Arm's user-space drivers, whose
+           OpenCL runs this workload faster than their Vulkan (see README), so AUTO tries OpenCL
+           before Vulkan there. */
+        const int opencl_first = want == NEURONTE_GPU_AUTO && access("/dev/mali0", F_OK) == 0;
         if (want == NEURONTE_GPU_AUTO || want == NEURONTE_GPU_CUDA) {
             rc = neuronte_gpu_cuda_open(g, opt, w1, sizeof w1);
             if (rc == 0)
                 g->backend = NEURONTE_GPU_CUDA;
+        }
+        if (rc && opencl_first) {
+            rc = neuronte_gpu_opencl_open(g, opt, w3, sizeof w3);
+            if (rc == 0)
+                g->backend = NEURONTE_GPU_OPENCL;
         }
         if (rc && (want == NEURONTE_GPU_AUTO || want == NEURONTE_GPU_VULKAN)) {
             rc = neuronte_gpu_vulkan_open(g, opt, w2, sizeof w2);
             if (rc == 0)
                 g->backend = NEURONTE_GPU_VULKAN;
         }
-        if (rc && (want == NEURONTE_GPU_AUTO || want == NEURONTE_GPU_OPENCL)) {
+        if (rc && !opencl_first && (want == NEURONTE_GPU_AUTO || want == NEURONTE_GPU_OPENCL)) {
             rc = neuronte_gpu_opencl_open(g, opt, w3, sizeof w3);
             if (rc == 0)
                 g->backend = NEURONTE_GPU_OPENCL;

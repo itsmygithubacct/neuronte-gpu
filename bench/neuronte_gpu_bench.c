@@ -8,9 +8,12 @@
  * order so its quality can be checked against teacher masks and the CPU
  * output.
  *
- * Output: one JSON object on stdout.
+ * Output: one JSON object on stdout. Anything else written to stdout while
+ * the bench runs (Rockchip's Mali driver prints its version there when it is
+ * loaded) is sent to stderr instead.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <sched.h>
@@ -109,6 +112,26 @@ static void snapshot(FILE *out, int cpu)
         if (v[0])
             fprintf(out, "%s\"card%d\":\"%s\"", z++ ? "," : "", c, v);
     }
+    /* devfreq devices (Mali GPUs, NPUs, memory controllers): current frequency and, where the
+       governor reports it, the load as "percent@frequency" */
+    fprintf(out, "},\"devfreq\":{");
+    {
+        DIR *d = opendir("/sys/class/devfreq");
+        struct dirent *e;
+        z = 0;
+        while (d && (e = readdir(d))) {
+            char cur[64], load[96];
+            if (e->d_name[0] == '.' || strpbrk(e->d_name, "\"\\"))
+                continue;
+            snprintf(path, sizeof path, "/sys/class/devfreq/%.200s/cur_freq", e->d_name);
+            read_text(path, cur, sizeof cur);
+            snprintf(path, sizeof path, "/sys/class/devfreq/%.200s/load", e->d_name);
+            read_text(path, load, sizeof load);
+            fprintf(out, "%s\"%s\":{\"cur_freq\":\"%s\",\"load\":\"%s\"}", z++ ? "," : "", e->d_name, cur, load);
+        }
+        if (d)
+            closedir(d);
+    }
     fprintf(out, "},\"thermal\":{");
     for (z = 0; z < 32; z++) {
         char type[64], temp[64];
@@ -169,7 +192,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: neuronte_gpu_bench (--layout FILE [--models DIR] | --nrt FILE --cell WxH)\n"
-            "       [--backend auto|cuda|vulkan|cpu] [--device NAME] [--fast] [--no-fallback]\n"
+            "       [--backend auto|cuda|vulkan|opencl|cpu] [--device NAME] [--fast] [--no-fallback]\n"
             "       [--allow-cpu-device] [--shared-weights] [--samples S] [--block N] [--max-batch N] [--cpu K]\n"
             "       [--first SCALAR] [--count N] [--per-call N]\n"
             "       [--warmup-ms MS] [--warmup N] [--repeats N] [--passes N] [--single N] [--seed N] [--coverage-out FILE]\n");
@@ -253,6 +276,7 @@ int main(int argc, char **argv)
     if (!strcmp(backend, "auto")) opt.backend = NEURONTE_GPU_AUTO;
     else if (!strcmp(backend, "cuda")) opt.backend = NEURONTE_GPU_CUDA;
     else if (!strcmp(backend, "vulkan")) opt.backend = NEURONTE_GPU_VULKAN;
+    else if (!strcmp(backend, "opencl")) opt.backend = NEURONTE_GPU_OPENCL;
     else if (!strcmp(backend, "cpu")) opt.backend = NEURONTE_GPU_CPU;
     else usage();
     if (cpu >= 0) {
@@ -265,7 +289,15 @@ int main(int argc, char **argv)
         }
     }
 
-    FILE *o = stdout;
+    /* The JSON goes to the original stdout; file descriptor 1 is pointed at stderr so that a
+       driver printing to stdout cannot corrupt it. */
+    fflush(stdout);
+    int jfd = dup(1);
+    FILE *o = jfd >= 0 ? fdopen(jfd, "w") : NULL;
+    if (!o || dup2(2, 1) < 0) {
+        fprintf(stderr, "cannot separate the JSON output from stdout: %s\n", strerror(errno));
+        return 1;
+    }
     fprintf(o, "{\"tool\":\"neuronte_gpu_bench\",\"requested_backend\":\"%s\",\"layout\":\"%s\",\"nrt\":\"%s\","
             "\"cpu\":%d,\"flags\":%d,\"device_request\":\"%s\",\"block\":%d,\"max_batch\":%d,\"warmup\":%d,"
             "\"repeats\":%d,\"passes\":%d,\"seed\":%llu,\"first\":%u,\"count\":%d,\"per_call\":%d,",
@@ -295,8 +327,11 @@ int main(int argc, char **argv)
                 *q = ' ';
         fprintf(o, ",\"backend\":\"%s\",\"fallback_reason\":\"%s\",\"device\":\"%s\",\"device_type\":\"%s\","
                 "\"versions\":\"%s\",\"cell\":[%d,%d],\"samples\":%d,\"hidden\":%d,\"tiles\":%d,\"exact\":%s",
-                /* a Vulkan device that is a CPU (lavapipe, with --allow-cpu-device) is never labelled a GPU */
-                !strcmp(neuronte_gpu_device_type(g), "cpu") ? "vulkan-cpu-device" : neuronte_gpu_backend_name(b),
+                /* a Vulkan or OpenCL device that is a CPU (lavapipe, PoCL; with --allow-cpu-device) is never
+                   labelled a GPU */
+                !strcmp(neuronte_gpu_device_type(g), "cpu")
+                    ? (b == NEURONTE_GPU_OPENCL ? "opencl-cpu-device" : "vulkan-cpu-device")
+                    : neuronte_gpu_backend_name(b),
                 fr, neuronte_gpu_device(g), neuronte_gpu_device_type(g),
                 neuronte_gpu_versions(g), cw, ch, neuronte_gpu_samples(g), neuronte_gpu_hidden(g),
                 neuronte_gpu_tiles(g), neuronte_gpu_exact(g) ? "true" : "false");

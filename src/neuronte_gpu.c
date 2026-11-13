@@ -40,6 +40,7 @@ const char *neuronte_gpu_backend_name(int backend)
     switch (backend) {
     case NEURONTE_GPU_CUDA: return "gpu-cuda";
     case NEURONTE_GPU_VULKAN: return "gpu-vulkan";
+    case NEURONTE_GPU_OPENCL: return "gpu-opencl";
     case NEURONTE_GPU_CPU_FALLBACK: return "cpu-fallback";
     case NEURONTE_GPU_CPU: return "cpu";
     default: return "unknown";
@@ -561,7 +562,7 @@ int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out
         neuronte_gpu_say(why, sizeof why, "a %dx%d tile with %d samples per axis is too large for the GPU kernel",
                          wmax, hmax, g->samples);
     else if (pack(g, why, sizeof why) == 0) {
-        char w1[512] = "", w2[512] = "";
+        char w1[512] = "", w2[512] = "", w3[512] = "";
         int rc = -1;
         if (want == NEURONTE_GPU_AUTO || want == NEURONTE_GPU_CUDA) {
             rc = neuronte_gpu_cuda_open(g, opt, w1, sizeof w1);
@@ -573,12 +574,18 @@ int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out
             if (rc == 0)
                 g->backend = NEURONTE_GPU_VULKAN;
         }
+        if (rc && (want == NEURONTE_GPU_AUTO || want == NEURONTE_GPU_OPENCL)) {
+            rc = neuronte_gpu_opencl_open(g, opt, w3, sizeof w3);
+            if (rc == 0)
+                g->backend = NEURONTE_GPU_OPENCL;
+        }
         if (rc == 0) {
             *out = g;
             return 0;
         }
-        neuronte_gpu_say(why, sizeof why, "%s%s%s%s%s", w1[0] ? "cuda: " : "", w1, w1[0] && w2[0] ? "; " : "",
-                         w2[0] ? "vulkan: " : "", w2);
+        neuronte_gpu_say(why, sizeof why, "%s%s%s%s%s%s%s", w1[0] ? "cuda: " : "", w1,
+                         w1[0] && (w2[0] || w3[0]) ? "; " : "", w2[0] ? "vulkan: " : "", w2,
+                         w2[0] && w3[0] ? "; opencl: " : w3[0] ? "opencl: " : "", w3);
     }
     if (!(opt->flags & NEURONTE_GPU_ALLOW_FALLBACK)) {
         neuronte_gpu_say(reason, reason_len, "no GPU backend: %s", why);

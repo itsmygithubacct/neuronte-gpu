@@ -73,6 +73,7 @@ struct neuronte_gpu {
  * and g->device_type. */
 int neuronte_gpu_cuda_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
 int neuronte_gpu_vulkan_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
+int neuronte_gpu_opencl_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
 
 /* Embedded kernels (generated at build time). */
 struct embedded_ptx {
@@ -90,6 +91,9 @@ struct embedded_spirv {
 };
 extern const struct embedded_spirv neuronte_gpu_spirv[];
 extern const int neuronte_gpu_spirv_count;
+
+/* OpenCL C source of kernels/cover.cl, NUL-terminated ("" when not embedded). */
+extern const char neuronte_gpu_opencl_source[];
 
 /* blocks along z for a launch of `blocks` blocks: more when the launch is too small to fill the device */
 int neuronte_gpu_splits(const neuronte_gpu *g, int blocks);

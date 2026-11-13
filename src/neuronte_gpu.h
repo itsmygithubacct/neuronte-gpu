@@ -5,8 +5,9 @@
  * described by a layout file (tools/layout.py writes one from a kilix-bench
  * experiment manifest) or by a single .nrt file.
  *
- * Backends: CUDA (NVIDIA, through the driver library loaded at run time) and
- * Vulkan compute (any GPU with a Vulkan driver). When neither can be used,
+ * Backends: CUDA (NVIDIA, through the driver library loaded at run time),
+ * Vulkan compute (any GPU with a Vulkan driver) and OpenCL (any GPU with an
+ * OpenCL 1.2 driver; written for Arm Mali). When none can be used,
  * the handle can fall back to the reference CPU library with the same tiles.
  * The active backend and device are always reported; fallback results are
  * CPU results.
@@ -29,17 +30,18 @@ extern "C" {
 typedef struct neuronte_gpu neuronte_gpu;
 
 enum neuronte_gpu_backend {
-    NEURONTE_GPU_AUTO = 0,         /* request: CUDA, then Vulkan */
+    NEURONTE_GPU_AUTO = 0,         /* request: CUDA, then Vulkan, then OpenCL */
     NEURONTE_GPU_CUDA = 1,         /* inference on an NVIDIA GPU through CUDA */
     NEURONTE_GPU_VULKAN = 2,       /* inference through Vulkan compute */
     NEURONTE_GPU_CPU_FALLBACK = 3, /* no usable GPU: the reference CPU library */
     NEURONTE_GPU_CPU = 4,          /* the CPU path was requested explicitly */
+    NEURONTE_GPU_OPENCL = 5,       /* inference through OpenCL */
 };
 
 enum neuronte_gpu_flags {
     NEURONTE_GPU_ALLOW_FALLBACK = 1,   /* fall back to the CPU instead of failing open */
     NEURONTE_GPU_FAST = 2,             /* allow fused multiply-adds (not bit-exact) */
-    NEURONTE_GPU_ALLOW_CPU_DEVICE = 4, /* accept a Vulkan device that is a CPU (e.g. lavapipe);
+    NEURONTE_GPU_ALLOW_CPU_DEVICE = 4, /* accept a Vulkan or OpenCL device that is a CPU (e.g. lavapipe, PoCL);
                                         * it is reported as such, never as a GPU */
     NEURONTE_GPU_SHARED_WEIGHTS = 8,   /* Vulkan: copy layers 2-4 to shared memory instead of
                                         * reading them from the parameter buffer (CUDA always
@@ -52,7 +54,7 @@ struct neuronte_gpu_options {
     const char *nrt_path;    /* one network over the whole cell, when layout_path is NULL */
     int cell_w, cell_h;      /* with nrt_path */
     int samples;             /* per axis; 0 = the library's choice for the cell width */
-    int backend;             /* enum neuronte_gpu_backend: AUTO, CUDA, VULKAN or CPU */
+    int backend;             /* enum neuronte_gpu_backend: AUTO, CUDA, VULKAN, OPENCL or CPU */
     const char *device;      /* substring of the device name to select; NULL = the first GPU */
     int flags;
     int max_batch;           /* glyphs per launch; 0 = 1024 */
@@ -62,7 +64,8 @@ struct neuronte_gpu_options {
 /* Per-call stage times in nanoseconds. GPU stages are zero on the CPU path. */
 struct neuronte_gpu_timing {
     uint64_t upload;   /* scalars to the device */
-    uint64_t run;      /* the kernel, as the device measured it (CUDA events, Vulkan timestamps) */
+    uint64_t run;      /* the kernel, as the device measured it (CUDA events, Vulkan timestamps,
+                        * OpenCL profiling) */
     uint64_t wait;     /* submit to completion, as the host saw it */
     uint64_t download; /* coverage back to the caller's buffer */
     uint64_t cpu_eval; /* reference CPU evaluation: the CPU paths, or glyphs the GPU path cannot draw */
@@ -81,7 +84,7 @@ const char *neuronte_gpu_fallback_reason(const neuronte_gpu *g);
 /* Device name, and the driver/API versions, of the active backend; "" on the CPU. */
 const char *neuronte_gpu_device(const neuronte_gpu *g);
 const char *neuronte_gpu_versions(const neuronte_gpu *g);
-/* "gpu", "integrated-gpu", "cpu" (a Vulkan CPU device) or "" */
+/* "gpu", "integrated-gpu", "accelerator" (OpenCL), "cpu" (a Vulkan or OpenCL CPU device) or "" */
 const char *neuronte_gpu_device_type(const neuronte_gpu *g);
 int neuronte_gpu_cell(const neuronte_gpu *g, int *w, int *h);
 int neuronte_gpu_samples(const neuronte_gpu *g);

@@ -9,9 +9,11 @@
 # or by nvcc (PTXCC=nvcc); CUDA=0 builds without them. Vulkan kernels are
 # SPIR-V, made by glslc; VULKAN=0 builds without the Vulkan backend, which is
 # the default when the Vulkan headers are not found (VULKAN_INCLUDE=DIR points
-# at a copy; only the headers are needed to build). The
-# driver libraries (libcuda.so.1, libvulkan.so.1) are loaded at run time with
-# dlopen, so the binary also runs, on the CPU path, where neither exists.
+# at a copy; only the headers are needed to build). The OpenCL kernel is
+# embedded as source and compiled by the driver at open; the backend needs no
+# headers or tools. The driver libraries (libcuda.so.1, libvulkan.so.1,
+# libOpenCL.so.1) are loaded at run time with dlopen, so the binary also runs,
+# on the CPU path, where none exists.
 
 CC ?= cc
 CFLAGS ?= -O2
@@ -39,7 +41,7 @@ LDLIBS += $(NEURONTE_DIR)/build/libneuronte.a -ldl -lm -lpthread
 PTX = $(if $(filter 1,$(CUDA)),$(foreach h,$(HIDDEN),build/cover_h$(h).ptx))
 SPV = $(if $(filter 1,$(VULKAN)),build/cover_exact1.spv build/cover_exact0.spv)
 VK_OBJ = $(if $(filter 1,$(VULKAN)),build/backend_vulkan.o,build/backend_none.o)
-OBJS = build/neuronte_gpu.o build/backend_cuda.o $(VK_OBJ) build/kernels.o
+OBJS = build/neuronte_gpu.o build/backend_cuda.o $(VK_OBJ) build/backend_opencl.o build/kernels.o
 
 all: build/libneuronte_gpu.a build/neuronte_gpu_bench
 
@@ -63,11 +65,11 @@ endif
 build/cover_exact%.spv: kernels/cover.comp build/config.stamp | build
 	$(GLSLC) -fshader-stage=compute --target-env=vulkan1.1 -O $(GLSLFLAGS) -DEXACT=$* -o $@ $<
 
-build/kernels.c: tools/embed.py $(PTX) $(SPV) build/config.stamp | build
+build/kernels.c: tools/embed.py $(PTX) $(SPV) kernels/cover.cl build/config.stamp | build
 	$(PYTHON) tools/embed.py $@ --ptx $(foreach h,$(if $(PTX),$(HIDDEN)),$(h)=build/cover_h$(h).ptx) \
-	    --spirv $(if $(SPV),1=build/cover_exact1.spv 0=build/cover_exact0.spv)
+	    --spirv $(if $(SPV),1=build/cover_exact1.spv 0=build/cover_exact0.spv) --opencl kernels/cover.cl
 
-build/%.o: src/%.c src/neuronte_gpu.h src/internal.h | build
+build/%.o: src/%.c src/neuronte_gpu.h src/internal.h src/clmini.h | build
 	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -c -o $@ $<
 
 build/kernels.o: build/kernels.c src/internal.h

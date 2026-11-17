@@ -291,7 +291,8 @@ if [ -x "${CHOOSER_CELLS_TOOL:-}" ] && [ -r "${CHOOSER_CELLS_NRT:-}" ]; then
     mkdir -p "$T/cw"
     cp -p "$CHOOSER_CELLS_NRT" "$T/cw/"
     CN=$(basename "$CHOOSER_CELLS_NRT" .nrt)
-    printf '%s\n' "cells.$CN=8x16" "cells_chars.$CN=all" "cells_styles.$CN=regular" > "$T/cells.conf"
+    # one size, every character, and none of the marks the tool adds at other sizes by default
+    printf '%s\n' "cells.$CN=8x16" "cells_chars.$CN=all" "cells_styles.$CN=regular" "cells_marks.$CN=none" > "$T/cells.conf"
     is 0 "the tool writes a cells file" "$CHOOSER_CELLS_TOOL" --weights "$T/cw" --out "$S/cells" --conf "$T/cells.conf" --threads 2
     NEURONTE_BACKEND=cpu "$B/neuronte-backend" "$T/cw/$CN.nrt" 8x16 > "$T/out" 2>&1
     has "$T/out" "answered from: cells file [1-9]" "glyphs come from the cells file"

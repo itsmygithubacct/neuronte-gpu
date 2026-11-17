@@ -63,6 +63,32 @@ int main(void)
     nb_decide(&in, &out);
     OK(out.chosen == 0 && out.min_glyphs == 256 && !out.single && !out.burst && out.bulk && !out.bulk_vs_threads);
 
+    /* timed in rounds, a GPU near the line (the Quadro M2000M's figures of 17 November): by the
+     * medians it wins from 16 glyphs, but one round in three was under the margin at 16, 64 and
+     * 256, so those sizes stay with the CPU and only whole tables go to it. The choice is made on
+     * the worst round, whatever cpu1 says. */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1152, (double[]){208, 335, 416, 397, 410}, 185);
+    {
+        struct nb_decide_backend *b = gpu(&in, "cuda", 1, 0, 0, (double[]){297, 241, 252, 257, 222});
+        memcpy(b->cpu[0], (double[]){208, 335, 416, 397, 410}, sizeof b->cpu[0]);
+        memcpy(b->worst[0], (double[]){0.70, 1.39, 1.65, 1.55, 1.85}, sizeof b->worst[0]);
+        nb_decide(&in, &out);
+        OK(out.chosen == 0 && out.min_glyphs == 16 && !out.single && out.burst);
+        memcpy(b->worst[0], (double[]){0.70, 1.22, 1.28, 1.31, 1.62}, sizeof b->worst[0]);
+        nb_decide(&in, &out);
+        OK(out.chosen == 0 && out.min_glyphs == 256 && !out.burst && out.bulk);
+        OK(strstr(out.reason, "at least 1.6 times") && strstr(out.reason, "in every round"));
+        memcpy(b->worst[0], (double[]){0.70, 1.22, 1.28, 1.29, 1.62}, sizeof b->worst[0]);
+        nb_decide(&in, &out);
+        OK(out.chosen == 0 && out.min_glyphs == 1152 && !out.burst && out.bulk);
+        memcpy(b->worst[0], (double[]){0.70, 1.22, 1.28, 1.29, 1.29}, sizeof b->worst[0]);
+        nb_decide(&in, &out);
+        OK(out.chosen == -1 && out.min_glyphs == 0);
+    }
+
     /* under the margin by a hair: the CPU */
     memset(&in, 0, sizeof in);
     in.margin = 1.3;

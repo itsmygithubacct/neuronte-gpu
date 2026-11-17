@@ -26,9 +26,9 @@
  *   backend.cells=8x16,16x32  the cell sizes to measure
  *   backend.margin=1.3        how many times faster than one CPU thread a GPU must be
  *   backend.desktop_margin=2  the same for a GPU that also draws the desktop (whole tables only)
- *   backend.step_seconds=90   all of step 10's GPU work; backend.compile_seconds=60 for a
+ *   backend.step_seconds=150  all of step 10's GPU work; backend.compile_seconds=60 for a
  *                             backend's first open (kernels may be compiled) and
- *                             backend.probe_seconds=30 for its comparing and timing, inside that
+ *                             backend.probe_seconds=60 for its comparing and timing, inside that
  *   backend.warm_seconds=300  all of step 40
  *   backend.max_batch=1024    glyphs per GPU call
  *   backend.covered=latin1    the characters cells files hold, which are compared but left out of
@@ -267,6 +267,16 @@ static int repeats_of(int size_index)
     return r[size_index];
 }
 
+/* A GPU backend is timed in ROUNDS rounds. In each, every size is timed on the CPU and then on
+ * the GPU with the same calls, so that other work on the machine falls on both; the backend has
+ * to win in every round. How often a size is timed in one round: */
+#define ROUNDS 3
+static int round_repeats(int size_index)
+{
+    static const int r[NSIZES] = {6, 3, 2, 1, 1};
+    return r[size_index];
+}
+
 /* The i-th call of `size` glyphs: characters spread evenly over the timed part of the table,
  * from a start that moves with i, so that a small call mixes the file's nets as the table does
  * and no two calls are the same. The largest call is that part in order. */
@@ -500,21 +510,52 @@ static void probe_child(int fd, const char *lib_path, const char *backend, struc
             }
         }
         fprintf(out, "soak.%d=%d %d\n", k, calls, differing);
-        for (s = 0; s < NSIZES; s++) {
-            double t[32];
-            int size = w->sizes[s], reps = repeats_of(s);
-            if (size > w->timed)
-                continue;
-            for (i = 0; i < reps; i++) {
-                const uint32_t *list = window(w, size, i, pick);
-                double c0 = nb_now();
-                if (gpu_cover(&g, h, list, size, got, plane, max_batch)) {
-                    fprintf(out, "error=a call of %d glyphs failed\n", size);
-                    exit(0);
-                }
-                t[i] = (nb_now() - c0) * 1e6 / size;
+        {
+            double gt[NSIZES][ROUNDS], ct[NSIZES][ROUNDS];
+            neuronte *cpu = NULL;
+            int r;
+            if (neuronte_open_file(w->path, &cpu) != NEURONTE_OK) {
+                fprintf(out, "error=the library cannot open the file\n");
+                exit(0);
             }
-            fprintf(out, "t.%d.%d=%.3f\n", k, s, median(t, reps));
+            for (r = 0; r < ROUNDS; r++)
+                for (s = 0; s < NSIZES; s++) {
+                    double t[32];
+                    int size = w->sizes[s], reps = round_repeats(s);
+                    if (size > w->timed)
+                        continue;
+                    for (i = 0; i < reps; i++) {
+                        const uint32_t *list = window(w, size, r * reps + i, pick);
+                        double c0 = nb_now();
+                        for (j = 0; j < size; j++)
+                            neuronte_coverage(cpu, list[j], w->cell.w, w->cell.h, 0, got + (size_t)j * plane);
+                        t[i] = (nb_now() - c0) * 1e6 / size;
+                    }
+                    ct[s][r] = median(t, reps);
+                    for (i = 0; i < reps; i++) {
+                        const uint32_t *list = window(w, size, r * reps + i, pick);
+                        double c0 = nb_now();
+                        if (gpu_cover(&g, h, list, size, got, plane, max_batch)) {
+                            fprintf(out, "error=a call of %d glyphs failed\n", size);
+                            exit(0);
+                        }
+                        t[i] = (nb_now() - c0) * 1e6 / size;
+                    }
+                    gt[s][r] = median(t, reps);
+                }
+            neuronte_close(cpu);
+            for (s = 0; s < NSIZES; s++) {
+                double worst = 0;
+                if (w->sizes[s] > w->timed)
+                    continue;
+                for (r = 0; r < ROUNDS; r++)
+                    if (gt[s][r] > 0 && (worst == 0 || ct[s][r] / gt[s][r] < worst))
+                        worst = ct[s][r] / gt[s][r];
+                /* the worst round before the medians, which sort the rounds */
+                fprintf(out, "w.%d.%d=%.4f\n", k, s, worst);
+                fprintf(out, "t.%d.%d=%.3f\n", k, s, median(gt[s], ROUNDS));
+                fprintf(out, "c.%d.%d=%.3f\n", k, s, median(ct[s], ROUNDS));
+            }
         }
         g.close(h);
         free(got);
@@ -786,6 +827,7 @@ static int run_10(void)
     struct cell cells[4];
     int ncells = 0, nfiles, nworks = 0, i, k, s, rc, max_batch = atoi(setting("backend.max_batch", "1024"));
     double started = nb_now(), hard;
+    char load_before[128] = "";
 
     if (nb_mkdirs(state_dir)) {
         say("10-backend: cannot make %s", state_dir);
@@ -813,6 +855,7 @@ static int run_10(void)
         in.desktop_margin = in.margin;
 
     /* the work: files at cell sizes, with the CPU's planes and times */
+    nb_first_line("/proc/loadavg", load_before, sizeof load_before);
     copy = strdup(setting("backend.cells", "8x16,16x32"));
     for (t = strtok_r(copy, ", ", &save); t && ncells < 4; t = strtok_r(NULL, ", ", &save))
         if (sscanf(t, "%dx%d", &cells[ncells].w, &cells[ncells].h) == 2 && cells[ncells].w > 0 && cells[ncells].h > 0 &&
@@ -885,7 +928,7 @@ static int run_10(void)
         conf_cpu(&c, why);
     } else {
         /* the GPU work has its own clock: the CPU's part is over and cannot hang */
-        hard = nb_now() + atof(setting("backend.step_seconds", "90"));
+        hard = nb_now() + atof(setting("backend.step_seconds", "150"));
         copy = strdup(setting("backend.try", "cuda,vulkan"));
         for (t = strtok_r(copy, ", ", &save); t && in.nbackends < NB_BACKENDS; t = strtok_r(NULL, ", ", &save)) {
             struct probe_arg a = {lib, t, works, nworks, max_batch};
@@ -903,7 +946,7 @@ static int run_10(void)
                 nb_add(&m, "probe.%s=not tried: the step's time was used up\n", t);
                 continue;
             }
-            run_child(probe_entry, &a, atof(setting("backend.compile_seconds", "60")), atof(setting("backend.probe_seconds", "30")),
+            run_child(probe_entry, &a, atof(setting("backend.compile_seconds", "60")), atof(setting("backend.probe_seconds", "60")),
                       hard, &kv, &timed_out);
             err = nb_kv_get(&kv, "error", NULL);
             if (timed_out || err || !nb_kv_get(&kv, "done", NULL)) {
@@ -928,9 +971,17 @@ static int run_10(void)
                 for (s = 0; s < NSIZES; s++) {
                     snprintf(key, sizeof key, "t.%d.%d", k, s);
                     b->gpu[k][s] = atof(nb_kv_get(&kv, key, "-1"));
+                    snprintf(key, sizeof key, "c.%d.%d", k, s);
+                    b->cpu[k][s] = atof(nb_kv_get(&kv, key, "0"));
+                    snprintf(key, sizeof key, "w.%d.%d", k, s);
+                    b->worst[k][s] = atof(nb_kv_get(&kv, key, "0"));
                     if (b->gpu[k][s] > 0)
                         nb_add(&m, "measure.gpu-%s.%s.%dx%d.%s=%.1f\n", t, works[k].name, works[k].cell.w, works[k].cell.h,
                                size_name[s], b->gpu[k][s]);
+                    if (b->gpu[k][s] > 0 && b->cpu[k][s] > 0 && b->worst[k][s] > 0)
+                        nb_add(&m, "measure.gpu-%s.%s.%dx%d.%s.times_cpu=%.2f\nmeasure.gpu-%s.%s.%dx%d.%s.worst_round=%.2f\n", t,
+                               works[k].name, works[k].cell.w, works[k].cell.h, size_name[s], b->cpu[k][s] / b->gpu[k][s], t,
+                               works[k].name, works[k].cell.w, works[k].cell.h, size_name[s], b->worst[k][s]);
                 }
                 snprintf(key, sizeof key, "open_s.%d", k);
                 nb_add(&m, "measure.gpu-%s.%s.%dx%d.open_s=%s\n", t, works[k].name, works[k].cell.w, works[k].cell.h,
@@ -962,9 +1013,17 @@ static int run_10(void)
         nb_add(&c, "reason=%s%s%s\n", outd.reason, notes.len ? " | " : "", notes.s);
     }
     nb_add(&c, "threads=%d\nmargin=%.2f\ndesktop_margin=%.2f\n", threads, in.margin, in.desktop_margin);
+    {
+        char now[128];
+        nb_first_line("/proc/loadavg", now, sizeof now);
+        nb_add(&c, "measure.load=%s\nmeasure.load_after=%s\n", load_before, now);
+    }
     nb_add(&c, "# microseconds per glyph from call to answer. cpu1 is one thread. single, burst, batch, block and bulk are\n"
                "# calls of 1, 16, 64, 256 glyphs and of all the file's characters that are timed (measure.glyphs;\n"
-               "# measure.not_timed are held by cells files, and are compared only).\n%s", m.s);
+               "# measure.not_timed are held by cells files, and are compared only). A GPU backend is timed in three\n"
+               "# rounds, each with the CPU beside it on the same calls: times_cpu is the speed-up between the medians,\n"
+               "# worst_round the least of the three, which is the one the choice is made on. measure.load is the\n"
+               "# machine's load average before and after: a loaded machine makes the CPU look slower than it is.\n%s", m.s);
     rc = finish_10(&c, stamp, started);
     free(stamp);
     free(c.s);

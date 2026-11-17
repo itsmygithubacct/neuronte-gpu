@@ -40,9 +40,15 @@ itself and has its own test.
 
 Step 10 times one CPU thread and each GPU backend on calls of 1, 16, 64 and
 256 glyphs and on the whole table, at each cell size in `backend.cells`.
-A backend is used from the smallest call size at which, and above which, it
-is at least `backend.margin` (1.3) times as fast as one CPU thread on every
-file and size measured. That size is `min_glyphs`. A GPU that also draws the
+A GPU backend is timed in three rounds; in each round every call size is
+timed on the CPU and then on the GPU with the same calls, so that other work
+on the machine falls on both. A backend is used from the smallest call size
+at which, and above which, it is at least `backend.margin` (1.3) times as
+fast as one CPU thread on every file and size measured, in every one of the
+three rounds. That size is `min_glyphs`. A size that is in doubt therefore
+stays with the CPU. `backend.conf` records, for each size, the speed-up
+between the medians (`times_cpu`) and the least of the three rounds
+(`worst_round`), which is the one the choice is made on. A GPU that also draws the
 desktop is held to `backend.desktop_margin` (2) and to whole tables only.
 The first open, where a driver compiles kernels, is not counted against a
 GPU: step 40 pays it at setup.
@@ -54,6 +60,13 @@ net. Every character is still compared. They are left out at every size, not
 only the sizes a cells file holds, because step 10 runs before the step that
 writes the cells files.
 
+A loaded machine makes the CPU look slower than it is, and with it the GPU
+better than it is: `backend.conf` records the load average before and after
+the measuring (`measure.load`, `measure.load_after`). `neuronte-setup` runs
+the step again only when the driver, the GPU library, the GPUs, the kernel,
+the measured files or the settings change, never by itself; a choice made
+under heavy load stays until then, or until `neuronte-setup --force`.
+
 ## What was measured
 
 Two machines, 2026-11-17, `neuronte-split-v9`, microseconds per glyph, both
@@ -61,16 +74,23 @@ on mains power. Full files: the `measure.*` lines of each `backend.conf`.
 
 | | Core i7-9850H, Quadro RTX 3000 | Core i7-6820HQ, Quadro M2000M |
 |---|---|---|
-| Chosen | CUDA, every call (`min_glyphs=1`) | CUDA, calls of 16 or more (`min_glyphs=16`) |
+| Chosen | CUDA, every call (`min_glyphs=1`) | CUDA, whole tables only (`min_glyphs=1152`) |
 | Compared calls identical | 36 of 36 | 36 of 36 |
-| One glyph, 8x16: CPU / GPU | 269 / 102 | 208 / 297 |
-| Whole table, 8x16: CPU / 4 threads / GPU | 569 / 263 / 32 | 410 / 185 / 222 |
-| Whole table, 16x32: CPU / 4 threads / GPU | 1,986 / 958 / 129 | 1,402 / 743 / 887 |
-| Step 10 took | 29.5 s (load 7.9) | 23.3 s (load 0.7) |
+| One glyph, 8x16: CPU / GPU | 320 / 122 | 203 / 320 |
+| Whole table, 8x16: CPU / 4 threads / GPU | 553 / 337 / 57 | 358 / 175 / 222 |
+| Whole table, 16x32: CPU / 4 threads / GPU | 2,271 / 1,245 / 200 | 1,258 / 674 / 889 |
+| Least speed-up of three rounds: one glyph / whole table | 2.6 / 10.3 | 0.6 / 1.5 |
+| Step 10 took | 60.9 s (load 10.7; two backends) | 30.9 s (load 0.4; one backend) |
 
-The second machine is close to the margin: an earlier run the same day chose
-whole tables only. Its GPU is 1.4 to 1.9 times one CPU thread and slower than
-four.
+The first machine was busy with other work when it was measured (load 10.7);
+at load 7.9 an hour earlier the same step gave 269 / 102 for one glyph and
+569 / 263 / 32 for a whole table at 8x16. The choice was the same.
+
+The second machine is close to the margin: at 16 to 256 glyphs its GPU is
+1.2 to 1.4 times one CPU thread, and four CPU threads beat it on a whole
+table. Before the three rounds its choice moved between runs (whole tables
+in one, 16 glyphs and more in the next); with them, three runs in a row
+chose whole tables only.
 
 ## The two power settings
 

@@ -17,6 +17,11 @@ struct nb_decide_backend {
     int exact;         /* every compared call was byte for byte the CPU's */
     int draws_desktop; /* the GPU also draws the screen */
     double gpu[NB_WORKS][NB_SIZES]; /* microseconds per glyph; 0 or less: not measured */
+    /* When the backend was timed in rounds, each with the CPU beside it: the CPU's microseconds
+     * per glyph there, and the least speed-up over it among the rounds. 0: not timed so, and
+     * the speed-up is cpu1 over gpu. */
+    double cpu[NB_WORKS][NB_SIZES];
+    double worst[NB_WORKS][NB_SIZES];
 };
 
 struct nb_decide_in {
@@ -36,14 +41,15 @@ struct nb_decide_out {
     char reason[512];
 };
 
-/* The least speed-up over one CPU thread among the works measured at a size; 0 when none was. */
+/* The least speed-up over one CPU thread among the works measured at a size, and among the
+ * rounds of each where it was timed in rounds; 0 when none was. */
 static double nb_least_ratio(const struct nb_decide_in *in, const struct nb_decide_backend *b, int s, int *at)
 {
     double least = 0;
     int k;
     for (k = 0; k < in->nworks; k++)
-        if (in->cpu1[k][s] > 0 && b->gpu[k][s] > 0) {
-            double r = in->cpu1[k][s] / b->gpu[k][s];
+        if (b->gpu[k][s] > 0 && (b->worst[k][s] > 0 || in->cpu1[k][s] > 0)) {
+            double r = b->worst[k][s] > 0 ? b->worst[k][s] : in->cpu1[k][s] / b->gpu[k][s];
             if (least == 0 || r < least) {
                 least = r;
                 if (at)
@@ -54,7 +60,8 @@ static double nb_least_ratio(const struct nb_decide_in *in, const struct nb_deci
 }
 
 /* A backend is used from the smallest call size at which, and at every larger size, it is
- * `margin` times faster than one CPU thread on every work measured. A GPU that also draws the
+ * `margin` times faster than one CPU thread on every work measured, in every round it was
+ * timed in: a size that is in doubt stays with the CPU. A GPU that also draws the
  * desktop is used for whole tables only, and only at `desktop_margin`. A backend that differed
  * from the CPU by one byte is never used. Among backends, the one used from the smallest call;
  * then the one faster on a whole table. */
@@ -121,11 +128,12 @@ static void nb_decide(const struct nb_decide_in *in, struct nb_decide_out *out)
             if (g->gpu[k][NB_SIZES - 1] > 0 && in->cpun[k] > 0 && in->cpun[k] / g->gpu[k][NB_SIZES - 1] < in->margin)
                 out->bulk_vs_threads = 0;
         at = (size_t)snprintf(out->reason, sizeof out->reason,
-                              "%s is at least %.1f times one CPU thread on a whole table (%.1f against %.1f us/glyph)", g->name,
-                              best_bulk, g->gpu[w][NB_SIZES - 1], in->cpu1[w][NB_SIZES - 1]);
+                              "%s is at least %.1f times one CPU thread on a whole table%s (%.1f against %.1f us/glyph)", g->name,
+                              best_bulk, g->worst[w][NB_SIZES - 1] > 0 ? " in every round" : "", g->gpu[w][NB_SIZES - 1],
+                              g->cpu[w][NB_SIZES - 1] > 0 ? g->cpu[w][NB_SIZES - 1] : in->cpu1[w][NB_SIZES - 1]);
         if (r1 > 0 && at < sizeof out->reason)
             at += (size_t)snprintf(out->reason + at, sizeof out->reason - at, "; one glyph %.0f against %.0f", g->gpu[w1][0],
-                                   in->cpu1[w1][0]);
+                                   g->cpu[w1][0] > 0 ? g->cpu[w1][0] : in->cpu1[w1][0]);
         if (at < sizeof out->reason && best_min <= 1)
             at += (size_t)snprintf(out->reason + at, sizeof out->reason - at, "; used for every call");
         else if (at < sizeof out->reason)

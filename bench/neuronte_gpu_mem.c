@@ -1,6 +1,6 @@
 /* neuronte_gpu_mem: device memory of weight files held open together.
  *
- *   neuronte_gpu_mem --cell WxH [--backend cuda|vulkan] [--device NAME] [--max-batch N] [--draw] FILE.nrt ...
+ *   neuronte_gpu_mem --cell WxH [--backend cuda|vulkan|opengl] [--device NAME] [--max-batch N] [--draw] FILE.nrt ...
  *
  * Opens the files one after another on one device and keeps them open. After
  * each, prints what the handle allocated and, on NVIDIA devices, the device
@@ -79,7 +79,8 @@ int main(int argc, char **argv)
     }
     if (opt.cell_w < 1 || i >= argc)
         return 2;
-    opt.backend = !strcmp(backend, "vulkan") ? NEURONTE_GPU_VULKAN : NEURONTE_GPU_CUDA;
+    opt.backend = !strcmp(backend, "vulkan") ? NEURONTE_GPU_VULKAN
+                  : !strcmp(backend, "opengl") ? NEURONTE_GPU_OPENGL : NEURONTE_GPU_CUDA;
     opt.flags = NEURONTE_GPU_FILE;
     nvml_load();
     printf("{\"before\":{\"process_device_bytes\":%llu}}\n", process_bytes());

@@ -37,6 +37,8 @@ enum neuronte_gpu_backend {
     NEURONTE_GPU_CPU_FALLBACK = 3, /* no usable GPU: the reference CPU library */
     NEURONTE_GPU_CPU = 4,          /* the CPU path was requested explicitly */
     NEURONTE_GPU_OPENCL = 5,       /* inference through OpenCL */
+    NEURONTE_GPU_OPENGL = 6,       /* inference in an OpenGL 4.3 compute shader; only when asked for by
+                                    * name, and always as a file handle (see below) */
 };
 
 enum neuronte_gpu_flags {
@@ -49,6 +51,11 @@ enum neuronte_gpu_flags {
                                         * uses shared memory) */
     NEURONTE_GPU_FILE = 16,            /* open nrt_path as a file handle even when it is one narrow
                                         * net (any other file always is one, see below) */
+    NEURONTE_GPU_GL_CURRENT = 32,      /* OpenGL: use the context that is current on the calling thread,
+                                        * at open and at every call and at close, instead of making one.
+                                        * For a program that draws with OpenGL itself. The handle changes
+                                        * the shader storage buffer bindings 0 to 7 and the buffer bound to
+                                        * GL_SHADER_STORAGE_BUFFER, and restores the program in use. */
 };
 
 struct neuronte_gpu_options {

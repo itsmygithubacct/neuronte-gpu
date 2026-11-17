@@ -150,6 +150,7 @@ int neuronte_gpu_opencl_open(neuronte_gpu *g, const struct neuronte_gpu_options 
 
 int neuronte_gpu_cuda_open2(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
 int neuronte_gpu_vulkan_open2(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
+int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
 
 /* neuronte_gpu_v2.c */
 int neuronte_gpu_v2_wanted(const char *path, int flags);
@@ -181,6 +182,10 @@ struct embedded_spirv {
 };
 extern const struct embedded_spirv neuronte_gpu_spirv[];
 extern const int neuronte_gpu_spirv_count;
+
+/* GLSL text of the file-handle shaders, NUL-terminated, without a #version line. */
+extern const char neuronte_gpu_glsl_cover2[];
+extern const char neuronte_gpu_glsl_reduce[];
 
 /* OpenCL C source of kernels/cover.cl, NUL-terminated ("" when not embedded). */
 extern const char neuronte_gpu_opencl_source[];

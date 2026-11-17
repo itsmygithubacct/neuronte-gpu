@@ -373,6 +373,7 @@ int main(int argc, char **argv)
     else if (!strcmp(backend, "cuda")) opt.backend = NEURONTE_GPU_CUDA;
     else if (!strcmp(backend, "vulkan")) opt.backend = NEURONTE_GPU_VULKAN;
     else if (!strcmp(backend, "opencl")) opt.backend = NEURONTE_GPU_OPENCL;
+    else if (!strcmp(backend, "opengl")) opt.backend = NEURONTE_GPU_OPENGL;
     else if (!strcmp(backend, "cpu")) opt.backend = NEURONTE_GPU_CPU;
     else usage();
     if (cpu >= 0) {
@@ -426,7 +427,8 @@ int main(int argc, char **argv)
                 /* a Vulkan or OpenCL device that is a CPU (lavapipe, PoCL; with --allow-cpu-device) is never
                    labelled a GPU */
                 !strcmp(neuronte_gpu_device_type(g), "cpu")
-                    ? (b == NEURONTE_GPU_OPENCL ? "opencl-cpu-device" : "vulkan-cpu-device")
+                    ? (b == NEURONTE_GPU_OPENCL ? "opencl-cpu-device"
+                       : b == NEURONTE_GPU_OPENGL ? "opengl-cpu-device" : "vulkan-cpu-device")
                     : neuronte_gpu_backend_name(b),
                 fr, neuronte_gpu_device(g), neuronte_gpu_device_type(g),
                 neuronte_gpu_versions(g), cw, ch, neuronte_gpu_samples(g), neuronte_gpu_hidden(g),

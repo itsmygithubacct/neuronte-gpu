@@ -1174,6 +1174,11 @@ int neuronte_gpu_v2_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt
             if (rc == 0)
                 g->backend = NEURONTE_GPU_VULKAN;
         }
+        if (rc && want == NEURONTE_GPU_OPENGL) {
+            rc = neuronte_gpu_gl_open2(g, opt, w2, sizeof w2);
+            if (rc == 0)
+                g->backend = NEURONTE_GPU_OPENGL;
+        }
         if (rc && want == NEURONTE_GPU_OPENCL)
             neuronte_gpu_say(w2, sizeof w2, "the OpenCL backend draws single nets and layouts only");
         if (rc == 0)

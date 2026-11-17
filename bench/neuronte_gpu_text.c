@@ -59,7 +59,8 @@ int main(int argc, char **argv)
     opt.cell_w = em;
     opt.cell_h = 2 * em;
     opt.backend = !strcmp(backend, "cuda") ? NEURONTE_GPU_CUDA : !strcmp(backend, "vulkan") ? NEURONTE_GPU_VULKAN
-                : !strcmp(backend, "cpu") ? NEURONTE_GPU_CPU : NEURONTE_GPU_AUTO;
+                : !strcmp(backend, "opengl") ? NEURONTE_GPU_OPENGL : !strcmp(backend, "cpu") ? NEURONTE_GPU_CPU
+                : NEURONTE_GPU_AUTO;
     opt.flags = NEURONTE_GPU_FILE;
     if (neuronte_open_file(opt.nrt_path, &n) != NEURONTE_OK) {
         printf("{\"error\":\"the library cannot open the file\"}\n");

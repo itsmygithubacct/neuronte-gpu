@@ -42,6 +42,7 @@ const char *neuronte_gpu_backend_name(int backend)
     case NEURONTE_GPU_CUDA: return "gpu-cuda";
     case NEURONTE_GPU_VULKAN: return "gpu-vulkan";
     case NEURONTE_GPU_OPENCL: return "gpu-opencl";
+    case NEURONTE_GPU_OPENGL: return "gpu-opengl";
     case NEURONTE_GPU_CPU_FALLBACK: return "cpu-fallback";
     case NEURONTE_GPU_CPU: return "cpu";
     default: return "unknown";
@@ -517,7 +518,8 @@ int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out
     g->exact = !(opt->flags & NEURONTE_GPU_FAST);
     g->max_batch = opt->max_batch > 0 ? opt->max_batch : DEFAULT_BATCH;
     g->device_type = "";
-    if (!opt->layout_path && neuronte_gpu_v2_wanted(opt->nrt_path, opt->flags)) {
+    if (!opt->layout_path &&
+        neuronte_gpu_v2_wanted(opt->nrt_path, opt->backend == NEURONTE_GPU_OPENGL ? opt->flags | NEURONTE_GPU_FILE : opt->flags)) {
         if (neuronte_gpu_v2_open(g, opt, reason, reason_len))
             goto fail;
         *out = g;

@@ -49,7 +49,7 @@ PTX2 = $(if $(filter 1,$(CUDA)),$(foreach h,$(HIDDEN2),build/cover2_h$(h).ptx) \
 SPV = $(if $(filter 1,$(VULKAN)),build/cover_exact1.spv build/cover_exact0.spv \
     build/cover2_exact1.spv build/cover2_exact0.spv build/reduce.spv)
 VK_OBJ = $(if $(filter 1,$(VULKAN)),build/backend_vulkan.o,build/backend_none.o)
-OBJS = build/neuronte_gpu.o build/neuronte_gpu_v2.o build/backend_cuda.o $(VK_OBJ) build/backend_opencl.o build/kernels.o
+OBJS = build/neuronte_gpu.o build/neuronte_gpu_v2.o build/backend_cuda.o $(VK_OBJ) build/backend_opencl.o build/backend_gl.o build/kernels.o
 
 all: build/libneuronte_gpu.a build/neuronte_gpu_bench build/neuronte_gpu_text build/neuronte_gpu_mem
 

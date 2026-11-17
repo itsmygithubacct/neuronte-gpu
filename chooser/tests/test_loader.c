@@ -66,7 +66,7 @@ static void fresh_conf(void)
     put(conf, text, "w");
     free(text);
     /* what the stand-in measured as its smallest worthwhile call is not what is tested here */
-    put(conf, "min_glyphs=1\n", "a");
+    put(conf, "min_glyphs=1\nwake_ms=0\nidle_close_ms=0\n", "a");
     setenv("NEURONTE_BACKEND_CONF", conf, 1);
     snprintf(gpulog, sizeof gpulog, "%s/gpu.log", DIR_);
     unlink(gpulog);
@@ -217,7 +217,7 @@ static void gpu_chosen(void)
     b = open_it();
     OK(logged("open") == 0); /* nor does opening a handle */
     i0 = awake(b, 1);        /* the first call that wants the GPU has it opened */
-    OK(i0.gpu && !strcmp(i0.device, "Stand-in GPU") && logged("open") == 1);
+    OK(i0.gpu && i0.ready && !strcmp(i0.device, "Stand-in GPU") && logged("open") == 1);
     OK(same(b, 0x41, 1) && same(b, 0x2500, 3) && same(b, 0x20, MANY * 2));
     neuronte_backend_info(b, &i);
     OK(i.from_gpu == i0.from_gpu + 1 + 3 + MANY * 2 && i.from_cpu == i0.from_cpu && logged("open") == 1);
@@ -238,7 +238,7 @@ static void small_calls(void)
     OK(i.from_cpu == 15 && logged("open") == 0);
     OK(same(b, 0x20, 16)); /* wanted on the GPU, which is not open: the CPU answers, nothing waits */
     neuronte_backend_info(b, &i);
-    OK(i.from_cpu == 31 && i.from_gpu == 0);
+    OK(i.gpu && !i.ready && i.from_cpu == 31 && i.from_gpu == 0);
     nap_ms(300);
     OK(same(b, 0x40, 16)); /* and now it is */
     neuronte_backend_info(b, &i);
@@ -370,6 +370,8 @@ static void on_battery(void)
     battery("BAT0", "Discharging\n", 95, NULL);
     OK(neuronte_backend_choice(&i) == 0 && !strcmp(i.reason, "on battery"));
     b = open_it();
+    neuronte_backend_info(b, &i); /* known before anything is drawn */
+    OK(!i.gpu && !strcmp(i.reason, "on battery"));
     OK(same(b, 0x20, MANY));
     nap_ms(100);
     OK(same(b, 0x20, MANY));
@@ -615,6 +617,79 @@ static void arrives(void)
     neuronte_backend_close(b);
 }
 
+/* With wake_ms a few glyphs now and then never open the GPU; steady work for it does. */
+static void wake(void)
+{
+    enum { N = 2048, W = 32, H = 64 };
+    struct neuronte_backend_info i;
+    neuronte_backend *b = NULL;
+    uint32_t *list = malloc(N * sizeof *list);
+    float *got = malloc((size_t)N * W * H * sizeof *got);
+    int k;
+    fresh_conf();
+    conf_add("wake_ms=20");
+    OK(list && got && neuronte_backend_open(NRT, W, H, &b) == 0 && b);
+    for (k = 0; k < N; k++)
+        list[k] = 0x20 + (uint32_t)k;
+    for (k = 0; k < 12; k++) { /* typing: three glyphs, a pause */
+        OK(neuronte_backend_coverage(b, list + 3 * k, 3, got) == 0);
+        nap_ms(60);
+    }
+    neuronte_backend_info(b, &i);
+    OK(i.gpu && !i.ready && i.from_cpu == 36 && i.from_gpu == 0 && logged("open") == 0);
+    OK(neuronte_backend_coverage(b, list, N, got) == 0); /* a table: the GPU is opened and takes over */
+    neuronte_backend_info(b, &i);
+    OK(i.ready && i.from_cpu > 36 && i.from_gpu > 0 && i.from_cpu + i.from_gpu == 36 + N && logged("open") == 1);
+    OK(neuronte_backend_coverage(b, list, 3, got) == 0); /* open: small calls use it too */
+    neuronte_backend_info(b, &i);
+    OK(i.from_cpu + i.from_gpu == 36 + N + 3 && logged("coverage") == 2);
+    neuronte_backend_close(b);
+}
+
+/* A GPU that only wins on large calls: a call of that size wakes it and hands it the rest, a
+ * smaller one never does, unless the caller announced it as part of a large job. */
+static void large_only(void)
+{
+    enum { N = 2048, W = 32, H = 64 };
+    struct neuronte_backend_info i;
+    neuronte_backend *b = NULL;
+    uint32_t *list = malloc(N * sizeof *list);
+    float *got = malloc((size_t)N * W * H * sizeof *got);
+    char line[64];
+    int k;
+    fresh_conf();
+    snprintf(line, sizeof line, "min_glyphs=%d", N);
+    conf_add(line);
+    conf_add("wake_ms=20");
+    OK(list && got && neuronte_backend_open(NRT, W, H, &b) == 0 && b);
+    for (k = 0; k < N; k++)
+        list[k] = 0x20 + (uint32_t)k;
+    OK(neuronte_backend_coverage(b, list, N - 1, got) == 0); /* one short of a call for the GPU */
+    neuronte_backend_info(b, &i);
+    OK(i.gpu && i.min_glyphs == N && !i.ready && i.from_gpu == 0 && i.from_cpu == N - 1 && logged("open") == 0);
+    OK(neuronte_backend_coverage(b, list, N, got) == 0); /* the GPU opens under it and takes the rest */
+    neuronte_backend_info(b, &i);
+    OK(i.ready && i.from_gpu > 0 && i.from_cpu + i.from_gpu == 2 * N - 1 && logged("open") == 1);
+    OK(neuronte_backend_coverage(b, list, N, got) == 0); /* open: all of it */
+    neuronte_backend_info(b, &i);
+    OK(i.from_cpu + i.from_gpu == 3 * N - 1 && logged("coverage") == 2);
+    k = (int)i.from_cpu;
+    OK(neuronte_backend_coverage(b, list, 3, got) == 0); /* a small call stays on the CPU */
+    neuronte_backend_info(b, &i);
+    OK((int)i.from_cpu == k + 3 && logged("coverage") == 2);
+    neuronte_backend_expect(b, N); /* ... but not as a part of a large job */
+    OK(neuronte_backend_coverage(b, list, 3, got) == 0);
+    neuronte_backend_info(b, &i);
+    OK((int)i.from_cpu == k + 3 && logged("coverage") == 3);
+    neuronte_backend_expect(b, 0);
+    OK(neuronte_backend_coverage(b, list, 3, got) == 0);
+    neuronte_backend_info(b, &i);
+    OK((int)i.from_cpu == k + 6 && logged("coverage") == 3);
+    neuronte_backend_close(b);
+    free(list);
+    free(got);
+}
+
 /* With the stand-in cells file: U+0041 to U+005A at 8x16 are pre-drawn. */
 static void cells_first(void)
 {
@@ -716,6 +791,8 @@ int main(int argc, char **argv)
         bad += run("slow opening", slow_open);
         bad += run("GPU arrives in a call", arrives);
         bad += run("idle close", idle_close);
+        bad += run("waking the GPU", wake);
+        bad += run("large calls only", large_only);
         bad += run("arguments", arguments);
     }
     printf("test_loader%s: %d of the cases failed\n", argc > 4 ? " (cells)" : "", bad);

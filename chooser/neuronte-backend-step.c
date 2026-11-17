@@ -31,7 +31,12 @@
  *                             backend.probe_seconds=30 for its comparing and timing, inside that
  *   backend.warm_seconds=300  all of step 40
  *   backend.max_batch=1024    glyphs per GPU call
- *   backend.idle_close_ms=0   close the GPU after this long without a call (0: keep it open)
+ *   backend.covered=latin1    the characters cells files hold, which are compared but left out of
+ *                             the timed calls (none: time them all); latin1 where the reference
+ *                             library has cells files, else none
+ *   backend.idle_close_ms=1000  close the GPU after this long without a call (0: keep it open)
+ *   backend.wake_ms=50        open a closed GPU once the CPU has worked this long on glyphs that
+ *                             were for it (0: at the first such call)
  *   battery=cpu               on battery the CPU draws (default); a number N: only under N percent;
  *                             same: the battery changes nothing
  *
@@ -190,6 +195,12 @@ static int stamp_matches(const char *stamp_path, const char *want)
     return ok;
 }
 
+#ifdef NEURONTE_BACKEND_CELLS
+#define COVERED_DEFAULT "latin1"
+#else
+#define COVERED_DEFAULT "none"
+#endif
+
 /* ---- a file's characters ---- */
 
 /* The scalars a file has trained, in order, at most `cap`. */
@@ -220,8 +231,9 @@ struct work {
     struct cell cell;
     uint32_t *scalars;
     int count;
+    int timed;         /* the first `timed` of them are the ones no cells file holds: only they are timed */
     float *ref;        /* count planes from the CPU library */
-    int sizes[NSIZES]; /* 1, 16, 64, 256, count */
+    int sizes[NSIZES]; /* 1, 16, 64, 256, timed */
 };
 
 static uint32_t rng_state = 2463534242u;
@@ -252,16 +264,16 @@ static int repeats_of(int size_index)
     return r[size_index];
 }
 
-/* The i-th call of `size` glyphs: characters spread evenly over the whole table, from a
- * start that moves with i, so that a small call mixes the file's nets as the table does and
- * no two calls are the same. The whole table is the table in order. */
+/* The i-th call of `size` glyphs: characters spread evenly over the timed part of the table,
+ * from a start that moves with i, so that a small call mixes the file's nets as the table does
+ * and no two calls are the same. The largest call is that part in order. */
 static const uint32_t *window(const struct work *w, int size, int i, uint32_t *list)
 {
-    int j, start = (int)(((long long)i * 7919) % w->count);
-    if (size >= w->count)
+    int j, start = (int)(((long long)i * 7919) % w->timed);
+    if (size >= w->timed)
         return w->scalars;
     for (j = 0; j < size; j++)
-        list[j] = w->scalars[(start + (int)((long long)j * w->count / size)) % w->count];
+        list[j] = w->scalars[(start + (int)((long long)j * w->timed / size)) % w->timed];
     return list;
 }
 
@@ -283,7 +295,7 @@ static int measure_cpu(struct work *w, double us[NSIZES])
     for (s = 0; s < NSIZES; s++) {
         double t[32];
         int size = w->sizes[s], reps = s == NSIZES - 1 ? 2 : repeats_of(s);
-        if (size > w->count) {
+        if (size > w->timed) {
             us[s] = -1;
             continue;
         }
@@ -298,6 +310,10 @@ static int measure_cpu(struct work *w, double us[NSIZES])
         }
         us[s] = median(t, reps);
     }
+    /* the reference planes of the characters that are compared but not timed */
+    for (j = w->timed; j < w->count; j++)
+        if (neuronte_coverage(n, w->scalars[j], w->cell.w, w->cell.h, 0, w->ref + (size_t)j * plane) != NEURONTE_OK)
+            return -1;
     free(scratch);
     free(pick);
     neuronte_close(n);
@@ -328,23 +344,23 @@ static void *cpu_slice(void *arg)
     return NULL;
 }
 
-/* The whole table on `threads` threads, a handle each: microseconds per glyph. */
+/* The timed part of the table on `threads` threads, a handle each: microseconds per glyph. */
 static double measure_cpu_threads(const struct work *w)
 {
     pthread_t th[64];
     struct slice sl[64];
-    int nt = threads < 1 ? 1 : threads > 64 ? 64 : threads, i, per = (w->count + nt - 1) / nt;
+    int nt = threads < 1 ? 1 : threads > 64 ? 64 : threads, i, per = (w->timed + nt - 1) / nt;
     double t0 = nb_now();
     for (i = 0; i < nt; i++) {
         sl[i].w = w;
-        sl[i].first = i * per < w->count ? i * per : w->count;
-        sl[i].count = sl[i].first + per <= w->count ? per : w->count - sl[i].first;
+        sl[i].first = i * per < w->timed ? i * per : w->timed;
+        sl[i].count = sl[i].first + per <= w->timed ? per : w->timed - sl[i].first;
         sl[i].failed = 0;
         pthread_create(&th[i], NULL, cpu_slice, &sl[i]);
     }
     for (i = 0; i < nt; i++)
         pthread_join(th[i], NULL);
-    return (nb_now() - t0) * 1e6 / w->count;
+    return (nb_now() - t0) * 1e6 / w->timed;
 }
 
 /* ---- the GPU library, loaded in a child only ---- */
@@ -484,7 +500,7 @@ static void probe_child(int fd, const char *lib_path, const char *backend, struc
         for (s = 0; s < NSIZES; s++) {
             double t[32];
             int size = w->sizes[s], reps = repeats_of(s);
-            if (size > w->count)
+            if (size > w->timed)
                 continue;
             for (i = 0; i < reps; i++) {
                 const uint32_t *list = window(w, size, i, pick);
@@ -818,24 +834,45 @@ static int run_10(void)
             neuronte_close(n);
             if (w->count < 16)
                 continue;
+            w->timed = w->count;
+            if (!strcmp(setting("backend.covered", COVERED_DEFAULT), "latin1")) {
+                /* the characters the cells files hold are answered without a net: they are
+                 * compared like the rest, but timed calls are made of the others */
+                int held = 0;
+                while (held < w->count && w->scalars[held] <= 0xFF)
+                    held++;
+                if (held > 0 && w->count - held >= 16) {
+                    uint32_t *first = malloc((size_t)held * sizeof *first);
+                    if (first) {
+                        memcpy(first, w->scalars, (size_t)held * sizeof *first);
+                        memmove(w->scalars, w->scalars + held, (size_t)(w->count - held) * sizeof *first);
+                        memcpy(w->scalars + w->count - held, first, (size_t)held * sizeof *first);
+                        free(first);
+                        w->timed = w->count - held;
+                    }
+                }
+            }
             w->sizes[0] = 1;
             w->sizes[1] = 16;
             w->sizes[2] = 64;
             w->sizes[3] = 256;
-            w->sizes[4] = w->count;
+            w->sizes[4] = w->timed;
             memset(in.cpu1[nworks], 0, sizeof in.cpu1[nworks]);
             if (measure_cpu(w, in.cpu1[nworks])) {
                 say("10-backend: the library cannot draw %s", w->name);
                 continue;
             }
-            in.whole[nworks] = w->count;
+            in.whole[nworks] = w->timed;
             in.cpun[nworks] = measure_cpu_threads(w);
             for (s = 0; s < NSIZES; s++)
                 if (in.cpu1[nworks][s] > 0)
                     nb_add(&m, "measure.cpu1.%s.%dx%d.%s=%.1f\n", w->name, w->cell.w, w->cell.h, size_name[s], in.cpu1[nworks][s]);
             nb_add(&m, "measure.cpu%d.%s.%dx%d.bulk=%.1f\n", threads, w->name, w->cell.w, w->cell.h, in.cpun[nworks]);
-            if (k == 0)
-                nb_add(&m, "measure.glyphs.%s=%d\n", w->name, w->count);
+            if (k == 0) {
+                nb_add(&m, "measure.glyphs.%s=%d\n", w->name, w->timed);
+                if (w->timed < w->count)
+                    nb_add(&m, "measure.not_timed.%s=%d\n", w->name, w->count - w->timed);
+            }
             nworks++;
         }
     in.nworks = nworks;
@@ -913,7 +950,8 @@ static int run_10(void)
             nb_add(&c, "gpu.library=%s\ngpu.library.id=%s\ngpu.backend=%s\ngpu.device=%s\ngpu.driver=%s\n", lib, id, b->name,
                    devices[outd.chosen], drv);
             nb_add(&c, "gpu.identical=yes\ngpu.draws_desktop=%s\ngpu.max_batch=%d\n", b->draws_desktop ? "yes" : "no", max_batch);
-            nb_add(&c, "idle_close_ms=%d\n", atoi(setting("backend.idle_close_ms", "0")));
+            nb_add(&c, "idle_close_ms=%d\nwake_ms=%d\n", atoi(setting("backend.idle_close_ms", "1000")),
+                   atoi(setting("backend.wake_ms", "50")));
         }
         nb_add(&c, "use.single=%s\nuse.burst=%s\nuse.bulk=%s\nuse.bulk_vs_threads=%s\nmin_glyphs=%d\nbattery=%s\n",
                outd.single ? "gpu" : "cpu", outd.burst ? "gpu" : "cpu", outd.bulk ? "gpu" : "cpu",
@@ -922,7 +960,8 @@ static int run_10(void)
     }
     nb_add(&c, "threads=%d\nmargin=%.2f\ndesktop_margin=%.2f\n", threads, in.margin, in.desktop_margin);
     nb_add(&c, "# microseconds per glyph from call to answer. cpu1 is one thread. single, burst, batch, block and bulk are\n"
-               "# calls of 1, 16, 64, 256 glyphs and of the file's whole table.\n%s", m.s);
+               "# calls of 1, 16, 64, 256 glyphs and of all the file's characters that are timed (measure.glyphs;\n"
+               "# measure.not_timed are held by cells files, and are compared only).\n%s", m.s);
     rc = finish_10(&c, stamp, started);
     free(stamp);
     free(c.s);

@@ -46,6 +46,7 @@ struct neuronte_backend_info {
                        * "no backend.conf", "warming", "on battery", "device lost", ... */
     /* glyphs answered so far by each (zero from neuronte_backend_choice) */
     uint64_t from_cells, from_cpu, from_gpu;
+    int ready;        /* 1 when the GPU is open at this moment, so a call for it draws nothing on the CPU */
 };
 
 /* Open a weights file for cells of cell_w x cell_h pixels. Returns 0 and the
@@ -57,6 +58,13 @@ int neuronte_backend_open(const char *nrt_path, int cell_w, int cell_h, neuronte
  * per glyph, each glyph what neuronte_coverage(n, scalar, cell_w, cell_h, 0, ...)
  * writes. Returns 0, or the reference library's error. */
 int neuronte_backend_coverage(neuronte_backend *b, const uint32_t *scalars, int count, float *out);
+
+/* For a caller that draws a job a few glyphs at a time so as not to wait
+ * (a terminal's main thread): the calls that follow are parts of one job of
+ * `count` glyphs, and are judged for the GPU as a call of that size would
+ * be. Each call takes its glyphs off the job; 0 forgets it. Draws nothing
+ * and returns at once. */
+void neuronte_backend_expect(neuronte_backend *b, int count);
 
 /* What the handle is doing now. */
 void neuronte_backend_info(const neuronte_backend *b, struct neuronte_backend_info *info);

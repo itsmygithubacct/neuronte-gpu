@@ -44,6 +44,14 @@ class Nvml:
         v = (ctypes.c_uint * 2)()
         return v[0] if self.n.nvmlDeviceGetUtilizationRates(self.h, v) == 0 else None
 
+    def clock(self):
+        v = ctypes.c_uint()
+        return v.value if self.n.nvmlDeviceGetClockInfo(self.h, 0, ctypes.byref(v)) == 0 else None
+
+    def pstate(self):
+        v = ctypes.c_int()
+        return v.value if self.n.nvmlDeviceGetPerformanceState(self.h, ctypes.byref(v)) == 0 else None
+
     def temp(self):
         v = ctypes.c_uint()
         return v.value if self.n.nvmlDeviceGetTemperature(self.h, 0, ctypes.byref(v)) == 0 else None
@@ -66,6 +74,7 @@ def main():
     ap.add_argument('--sustain', type=float, default=60); ap.add_argument('--bursts', type=float, default=30)
     ap.add_argument('--burst-glyphs', type=int, default=3); ap.add_argument('--burst-gap', type=float, default=0.5)
     ap.add_argument('--backend', type=int, default=1)  # CUDA
+    ap.add_argument('--hold', type=float, default=0, help='instead: what ends the higher power state: handle kept, handle closed at once, a call each 5 s')
     ap.add_argument('--tail', type=float, default=0, help='instead: one small burst, then this many idle seconds, twice, then close')
     a = ap.parse_args()
     scalars = [int(l.strip()[2:], 16) if l.strip().upper().startswith('U+') else int(l, 0) for l in open(a.scalars) if l.strip()]
@@ -79,7 +88,7 @@ def main():
 
     def sampler():
         while not stop.is_set():
-            samples.append((time.monotonic(), phase[0], nv.watts(), nv.util(), nv.temp()))
+            samples.append((time.monotonic(), phase[0], nv.watts(), nv.util(), nv.temp(), nv.clock(), nv.pstate()))
             stop.wait(0.2)
     th = threading.Thread(target=sampler); th.start()
     marks = []  # (phase, t0, t1, joules0, joules1, glyphs, calls)
@@ -131,7 +140,26 @@ def main():
            'battery_start': battery(), 'load': open('/proc/loadavg').read().split()[:3],
            'burst': {'glyphs': a.burst_glyphs, 'gap_s': a.burst_gap}}
     span('idle', seconds=5)
-    if a.tail:
+    if a.hold:
+        c = cells[0]
+        some = scalars[10:10 + a.burst_glyphs]
+        def once(close):
+            def run():
+                g, buf = opened(a.backend, c)
+                res['device'] = lib.neuronte_gpu_device(g).decode()
+                draw(g, buf, some)
+                if close:
+                    lib.neuronte_gpu_close(g)
+                else:
+                    kept.append(g)
+                return a.burst_glyphs, 1
+            return run
+        kept = []
+        span('open, draw, keep', once(False)); span('tail kept', seconds=a.hold)
+        lib.neuronte_gpu_close(kept.pop()); span('tail after close', seconds=a.hold)
+        span('open, draw, close', once(True)); span('tail closed', seconds=a.hold)
+        span('open, draw, close 2', once(True)); span('tail closed 2', seconds=a.hold)
+    elif a.tail:
         c = cells[0]
         g, buf = opened(a.backend, c)
         res['device'] = lib.neuronte_gpu_device(g).decode()
@@ -184,12 +212,16 @@ def main():
         if glyphs:
             row['us_per_glyph_busy'] = None if name.find('bursts') >= 0 else (t1 - t0) / glyphs * 1e6
         res['phases'].append(row)
-    res['samples'] = [(round(s[0] - samples[0][0], 2), s[1], s[2], s[3], s[4]) for s in samples]
+    res['samples'] = [(round(s[0] - samples[0][0], 2), s[1], s[2], s[3], s[4], s[5], s[6]) for s in samples]
     res['battery_end'] = battery()
     json.dump(res, open(a.out, 'w'), indent=1)
-    if a.tail:
-        for t, ph, w, u, tc in res['samples']:
-            if int(t * 5) % 10 == 0: print('%6.1f s %-16s %5.1f W util %s temp %s' % (t, ph, w, u, tc))
+    if a.tail or a.hold:
+        last = None
+        for t, ph, w, u, tc, clk, ps in res['samples']:
+            key = (ph, w > 15, clk, ps)
+            if key != last or int(t * 5) % 25 == 0:
+                print('%6.1f s %-20s %5.1f W util %s temp %s clock %s MHz pstate %s' % (t, ph, w, u, tc, clk, ps))
+            last = key
     print(res['device'], 'idle %.1f W' % idle_w, res['battery_start'], '->', res['battery_end'])
     for r in res['phases']:
         print('%-18s %6.2f s glyphs %7d  mean %5.1f W peak %5.1f W  util mean %s peak %s  temp %s  gpu J %s  above idle %s  J/1000 glyphs %s (above idle %s)' % (

@@ -16,9 +16,17 @@ CHOOSER_NEURONTE_LIB ?= $(NEURONTE_DIR)/build/libneuronte.a
 CHOOSER_TEST_NRT ?= $(NEURONTE_DIR)/weights/neuronte-braille-v1.nrt
 # The runner neuronte-setup, when there is one to test the steps under.
 CHOOSER_SETUP ?=
+# The reference tree's cells tool and a terminal bundle, when it has them: the loader is then
+# also tested with a real cells file.
+CHOOSER_CELLS_TOOL ?= $(wildcard $(NEURONTE_DIR)/build/neuronte-cells)
+CHOOSER_CELLS_NRT ?= $(firstword $(wildcard $(NEURONTE_DIR)/weights/neuronte-kilix-*.nrt) \
+	$(wildcard $(NEURONTE_DIR)/weights/neuronte-term-*.nrt) $(wildcard $(NEURONTE_DIR)/weights/neuronte-split-v*.nrt))
+
+# A reference tree with cells files (neuronte_cells.h): the loader looks in them first.
+CHOOSER_CELLS ?= $(if $(wildcard $(NEURONTE_DIR)/include/neuronte_cells.h),-DNEURONTE_BACKEND_CELLS)
 
 CHOOSER_CC = $(CC) -std=c11 -O2 -g -Wall -Wextra -Wno-unused-function -fPIC \
-	-I$(CHOOSER_DIR) -I$(NEURONTE_GPU_INCLUDE) -I$(NEURONTE_DIR)/include $(CPPFLAGS) $(CFLAGS)
+	-I$(CHOOSER_DIR) -I$(NEURONTE_GPU_INCLUDE) -I$(NEURONTE_DIR)/include $(CHOOSER_CELLS) $(CPPFLAGS) $(CFLAGS)
 CHOOSER_HEADERS = $(CHOOSER_DIR)/common.h $(CHOOSER_DIR)/decide.h $(CHOOSER_DIR)/neuronte_backend.h \
 	$(NEURONTE_GPU_INCLUDE)/neuronte_gpu.h
 
@@ -29,7 +37,7 @@ $(CHOOSER_BUILD):
 	mkdir -p $(CHOOSER_BUILD)
 
 # The reference library is linked in and kept to itself: the library exports
-# the five neuronte_backend_ calls and nothing else.
+# the neuronte_backend_ calls and nothing else.
 $(CHOOSER_BUILD)/libneuronte-backend.so.0: $(CHOOSER_DIR)/neuronte_backend.c $(CHOOSER_HEADERS) $(CHOOSER_NEURONTE_LIB) | $(CHOOSER_BUILD)
 	$(CHOOSER_CC) -shared -Wl,-soname,libneuronte-backend.so.0 -Wl,--exclude-libs,ALL -o $@ \
 		$(CHOOSER_DIR)/neuronte_backend.c $(CHOOSER_NEURONTE_LIB) -lm -ldl -lpthread $(LDFLAGS)
@@ -71,7 +79,8 @@ $(CHOOSER_BUILD)/test_loader_tsan: $(CHOOSER_DIR)/tests/test_loader.c $(CHOOSER_
 test-chooser-sanitized: $(CHOOSER_BUILD)/test_loader_asan $(CHOOSER_BUILD)/test_loader_tsan test-chooser
 
 test-chooser: chooser $(CHOOSER_BUILD)/libfake_gpu.so $(CHOOSER_BUILD)/test_decide $(CHOOSER_BUILD)/test_loader $(CHOOSER_BUILD)/test_loader_cells
-	sh $(CHOOSER_DIR)/tests/run.sh $(CHOOSER_BUILD) $(CHOOSER_TEST_NRT) $(CHOOSER_SETUP)
+	CHOOSER_CELLS_TOOL=$(CHOOSER_CELLS_TOOL) CHOOSER_CELLS_NRT=$(CHOOSER_CELLS_NRT) \
+		sh $(CHOOSER_DIR)/tests/run.sh $(CHOOSER_BUILD) $(CHOOSER_TEST_NRT) $(CHOOSER_SETUP)
 
 # The loader for programs; the steps for neuronte-setup, in both of its
 # directories (40-backend-warm runs for the system and for each user).

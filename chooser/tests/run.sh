@@ -8,6 +8,9 @@
 #
 # BUILD holds what chooser.mk builds; NRT is a small weights file; the third
 # argument is the neuronte-setup command, to run the steps under it too.
+# CHOOSER_CELLS_TOOL (the reference tree's neuronte-cells) and
+# CHOOSER_CELLS_NRT (a terminal bundle it makes a cells file for), when both
+# are set, add the loader's test with a real cells file.
 set -u
 [ $# -ge 2 ] || { echo "usage: run.sh BUILD NRT [NEURONTE_SETUP]" >&2; exit 2; }
 B=$(cd "$1" && pwd) || exit 2
@@ -278,6 +281,25 @@ for san in "$B/test_loader_asan" "$B/test_loader_tsan"; do
         grep -v "checks, 0 failed" "$T/out" | head -60
     fi
 done
+
+# a cells file made by the reference tree's own tool, when there is one: the loader answers from
+# it, and what it answers is what the reference library draws
+if [ -x "${CHOOSER_CELLS_TOOL:-}" ] && [ -r "${CHOOSER_CELLS_NRT:-}" ]; then
+    echo "the loader and a real cells file"
+    mkdir -p "$T/cw"
+    cp -p "$CHOOSER_CELLS_NRT" "$T/cw/"
+    CN=$(basename "$CHOOSER_CELLS_NRT" .nrt)
+    printf '%s\n' "cells.$CN=8x16" "cells_chars.$CN=all" "cells_styles.$CN=regular" > "$T/cells.conf"
+    is 0 "the tool writes a cells file" "$CHOOSER_CELLS_TOOL" --weights "$T/cw" --out "$S/cells" --conf "$T/cells.conf" --threads 2
+    NEURONTE_BACKEND=cpu "$B/neuronte-backend" "$T/cw/$CN.nrt" 8x16 > "$T/out" 2>&1
+    has "$T/out" "answered from: cells file [1-9]" "glyphs come from the cells file"
+    has "$T/out" "differing from the reference library: 0\$" "none differs from the reference library"
+    NEURONTE_BACKEND=cpu "$B/neuronte-backend" "$T/cw/$CN.nrt" 9x18 > "$T/out" 2>&1
+    has "$T/out" "answered from: cells file 0," "another size is drawn, not found"
+    has "$T/out" "differing from the reference library: 0\$" "and none differs"
+else
+    echo "the loader and a real cells file: not run (no CHOOSER_CELLS_TOOL and CHOOSER_CELLS_NRT)"
+fi
 
 echo "chooser tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

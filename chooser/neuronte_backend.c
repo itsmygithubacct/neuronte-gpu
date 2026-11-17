@@ -30,24 +30,36 @@
 extern char **environ;
 
 /* ---- the cells file (setup step 30-cells) ----
- * Pre-drawn coverage for a weights file, mapped read-only. These are its
- * calls as they were agreed (header neuronte_cells.h, not yet written when
- * this was); they are weak references, so with a reference library that has
- * none the step is skipped. find() returns cell_w * cell_h floats that are
- * byte for byte neuronte_coverage()'s for the scalar, or NULL when the file
- * does not hold it at that size. The loader asks for the plain style, the
- * library's own sampling, and snap_below -1, which is what every file the
- * setup step writes was made under. */
+ * Pre-drawn coverage for a weights file, mapped read-only: STATE/cells/NAME.cells
+ * for NAME.nrt. find() returns cell_w * cell_h floats that are byte for byte
+ * neuronte_coverage()'s for the scalar, or NULL when the file does not hold
+ * it at that size. The loader asks for the plain style, the library's own
+ * sampling, and the weight file's own snap threshold, which is what every
+ * file the setup step writes was made under.
+ *
+ * Built with NEURONTE_BACKEND_CELLS (chooser.mk sets it when the reference
+ * tree has neuronte_cells.h) the calls are the library's. Without it they
+ * are weak references, declared as that header declares them: a reference
+ * library linked in as an archive then gives none (a weak reference takes
+ * nothing out of an archive) and the cells file is not looked at; a shared
+ * one gives them if it has them. */
+#if defined(NEURONTE_BACKEND_CELLS)
+#include "neuronte_cells.h"
+#define HAVE_CELLS 1
+#define CELLS_SNAP NEURONTE_CELLS_SNAP_FILE
+#elif defined(__GNUC__) && !defined(NEURONTE_BACKEND_NO_CELLS)
 typedef struct neuronte_cells neuronte_cells;
-#if defined(__GNUC__) && !defined(NEURONTE_BACKEND_NO_CELLS)
 extern int neuronte_cells_open(const char *cells_path, const char *weights_path, unsigned flags, neuronte_cells **out)
     __attribute__((weak));
 extern const float *neuronte_cells_find(const neuronte_cells *c, uint32_t scalar, int cell_w, int cell_h, int samples,
                                         unsigned style, int snap_below) __attribute__((weak));
 extern void neuronte_cells_close(neuronte_cells *c) __attribute__((weak));
 #define HAVE_CELLS (neuronte_cells_open && neuronte_cells_find && neuronte_cells_close)
+#define CELLS_SNAP (-1)
 #else
+typedef struct neuronte_cells neuronte_cells;
 #define HAVE_CELLS 0
+#define CELLS_SNAP (-1)
 #define neuronte_cells_open(p, w, f, o) (-1)
 #define neuronte_cells_find(c, s, w, h, n, y, b) ((const float *)NULL)
 #define neuronte_cells_close(c) ((void)0)
@@ -118,7 +130,7 @@ enum { BATTERY_SAME, BATTERY_CPU, BATTERY_FLOOR };
 
 struct choice {
     int gpu; /* setup chose a GPU for this machine and nothing forbids it */
-    int min_glyphs, max_batch, idle_close_ms;
+    int min_glyphs, max_batch, idle_close_ms, wake_ms;
     int battery_mode, battery_floor;
     char library[4096], backend[32], device[128], reason[256];
 };
@@ -219,7 +231,11 @@ static void choose(const char *file, struct choice *c)
     snprintf(c->backend, sizeof c->backend, "gpu-%.20s", nb_kv_get(&conf, "gpu.backend", ""));
     snprintf(c->device, sizeof c->device, "%s", nb_kv_get(&conf, "gpu.device", ""));
     c->max_batch = atoi(nb_kv_get(&conf, "gpu.max_batch", "1024"));
-    c->idle_close_ms = atoi(nb_kv_get(&conf, "idle_close_ms", "0"));
+    /* The defaults are what was measured on a laptop's discrete GPU: an open context holds it at
+     * about 30 W for 17 s after any call, a closed one lets it fall back within 2 s, and a few
+     * glyphs are drawn by the CPU in the time the GPU takes to wake. */
+    c->idle_close_ms = atoi(nb_kv_get(&conf, "idle_close_ms", "1000"));
+    c->wake_ms = atoi(nb_kv_get(&conf, "wake_ms", "50"));
     v = nb_kv_get(&conf, "battery", "cpu");
     if (!strcmp(v, "same"))
         c->battery_mode = BATTERY_SAME;
@@ -244,6 +260,7 @@ static int battery_forbids(const struct choice *c)
 /* ---- a handle ---- */
 
 enum { ST_CLOSED, ST_OPENING, ST_OPEN, ST_LOST };
+#define WAKE_LEAK 0.05
 
 struct neuronte_backend {
     neuronte *cpu;
@@ -262,10 +279,14 @@ struct neuronte_backend {
     neuronte_gpu *gpu, *dead;
     double last_use;
     char device[128], lost[256];
+    /* seconds the CPU has spent of late on glyphs that were for the GPU while it was closed;
+     * it runs off at WAKE_LEAK seconds a second, and at wake_ms the GPU is opened */
+    double debt, debt_at;
 
     double power_at;
     int on_battery;
     uint64_t from_cells, from_cpu, from_gpu;
+    int expect;     /* glyphs left of a job the caller announced (neuronte_backend_expect) */
     uint32_t *miss; /* the scalars of a call that the cells file does not hold */
     int *miss_at;   /* and their places in the call */
     float *tmp;
@@ -447,20 +468,50 @@ int neuronte_backend_open(const char *nrt_path, int cell_w, int cell_h, neuronte
     return NEURONTE_OK;
 }
 
-/* 1 when a call with `n` glyphs to compute is one for the GPU: setup chose one, the call is
- * large enough, the machine is not on battery and the device has not failed. The GPU is then
- * open or being opened; the call does not wait for it. */
-static int gpu_wanted(neuronte_backend *b, int n)
+/* Whether the machine runs from its battery in a way that forbids the GPU: looked at when
+ * asked, at most once a second. */
+static void look_at_power(neuronte_backend *b)
 {
-    double now;
-    int wanted;
-    if (!b->c.gpu || n < b->c.min_glyphs)
-        return 0;
-    now = nb_now();
+    double now = nb_now();
     if (b->power_at == 0 || now - b->power_at >= 1.0) {
         b->power_at = now;
         b->on_battery = battery_forbids(&b->c);
     }
+}
+
+/* Have the helper open the GPU, unless it is open, opening or lost. Called with the lock held. */
+static void gpu_start(neuronte_backend *b)
+{
+    if (b->state != ST_CLOSED || b->want_open)
+        return;
+    if (!b->helper_on) {
+        sigset_t all, old;
+        /* the helper takes none of the program's signals */
+        sigfillset(&all);
+        pthread_sigmask(SIG_BLOCK, &all, &old);
+        b->helper_on = pthread_create(&b->helper, NULL, helper_main, b) == 0;
+        pthread_sigmask(SIG_SETMASK, &old, NULL);
+        if (!b->helper_on) {
+            b->state = ST_LOST;
+            snprintf(b->lost, sizeof b->lost, "no thread could be started for the GPU");
+        }
+    }
+    if (b->helper_on) {
+        b->want_open = 1;
+        pthread_cond_broadcast(&b->cv);
+    }
+}
+
+/* 1 when a call with `n` glyphs to compute is one for the GPU: setup chose one, the call is
+ * large enough, the machine is not on battery and the device has not failed. The call does
+ * not wait for the GPU. With wake_ms 0 a closed GPU is opened now; otherwise once the CPU has
+ * worked wake_ms on such calls (gpu_take), so that a few glyphs now and then never wake it. */
+static int gpu_wanted(neuronte_backend *b, int n)
+{
+    int wanted;
+    if (!b->c.gpu || n < b->c.min_glyphs)
+        return 0;
+    look_at_power(b);
     pthread_mutex_lock(&b->mu);
     if (b->on_battery) {
         if (b->state == ST_OPEN) {
@@ -470,30 +521,15 @@ static int gpu_wanted(neuronte_backend *b, int n)
         pthread_mutex_unlock(&b->mu);
         return 0;
     }
-    if (b->state == ST_CLOSED && !b->want_open) {
-        if (!b->helper_on) {
-            sigset_t all, old;
-            /* the helper takes none of the program's signals */
-            sigfillset(&all);
-            pthread_sigmask(SIG_BLOCK, &all, &old);
-            b->helper_on = pthread_create(&b->helper, NULL, helper_main, b) == 0;
-            pthread_sigmask(SIG_SETMASK, &old, NULL);
-            if (!b->helper_on) {
-                b->state = ST_LOST;
-                snprintf(b->lost, sizeof b->lost, "no thread could be started for the GPU");
-            }
-        }
-        if (b->helper_on) {
-            b->want_open = 1;
-            pthread_cond_broadcast(&b->cv);
-        }
-    }
+    if (b->c.wake_ms <= 0)
+        gpu_start(b);
     wanted = b->state != ST_LOST;
     pthread_mutex_unlock(&b->mu);
     return wanted;
 }
 
-/* 1 when the GPU is open: it is then marked busy until gpu_done(). -1 when it will not open. */
+/* 1 when the GPU is open: it is then marked busy until gpu_done(). -1 when it will not open.
+ * A closed GPU is opened when the CPU's recent work for it has reached wake_ms. */
 static int gpu_take(neuronte_backend *b)
 {
     int r = 0;
@@ -502,10 +538,20 @@ static int gpu_take(neuronte_backend *b)
         r = -1;
     else if (b->state == ST_OPEN && !b->drop) {
         b->busy = 1;
+        b->debt = 0;
         r = 1;
-    }
+    } else if (b->state == ST_CLOSED && b->debt * 1000.0 >= b->c.wake_ms)
+        gpu_start(b);
     pthread_mutex_unlock(&b->mu);
     return r;
+}
+
+/* The CPU drew glyphs that were for the GPU from t0 to t1. */
+static void cpu_worked(neuronte_backend *b, double t0, double t1)
+{
+    double left = b->debt - WAKE_LEAK * (t0 - b->debt_at);
+    b->debt = (left > 0 ? left : 0) + (t1 - t0);
+    b->debt_at = t1;
 }
 
 static void gpu_done(neuronte_backend *b, int failed)
@@ -529,6 +575,7 @@ int neuronte_backend_coverage(neuronte_backend *b, const uint32_t *scalars, int 
 {
     const uint32_t *list = scalars;
     int n = count, i, rc, indirect = 0, wanted, done = 0;
+    double t0;
     if (!b || count < 0 || (count > 0 && (!scalars || !out)))
         return NEURONTE_ERR_ARG;
     if (count == 0)
@@ -550,7 +597,7 @@ int neuronte_backend_coverage(neuronte_backend *b, const uint32_t *scalars, int 
         }
         n = 0;
         for (i = 0; i < count; i++) {
-            const float *have = neuronte_cells_find(b->cells, scalars[i], b->cw, b->ch, 0, 0, -1);
+            const float *have = neuronte_cells_find(b->cells, scalars[i], b->cw, b->ch, 0, 0, CELLS_SNAP);
             if (have) {
                 memcpy(out + (size_t)i * b->plane, have, b->plane * sizeof *out);
                 b->from_cells++;
@@ -566,10 +613,14 @@ int neuronte_backend_coverage(neuronte_backend *b, const uint32_t *scalars, int 
             indirect = 1;
         }
     }
-    wanted = gpu_wanted(b, n);
+    /* judged by its own size, or by that of the job it was announced as a part of */
+    wanted = gpu_wanted(b, b->expect > n ? b->expect : n);
+    b->expect = b->expect > count ? b->expect - count : 0;
     while (done < n) {
         int left = n - done, few;
-        if (wanted && left >= b->c.min_glyphs) {
+        /* A call for the GPU goes to it whole when it is open. When it opens while the CPU is
+         * drawing, it gets what is left if that is still a call for it, or at least half. */
+        if (wanted && (left >= b->c.min_glyphs || 2 * left >= n)) {
             int r = gpu_take(b);
             if (r > 0) {
                 float *dst = out + (size_t)done * b->plane;
@@ -595,15 +646,24 @@ int neuronte_backend_coverage(neuronte_backend *b, const uint32_t *scalars, int 
             wanted = 0;
         /* on the CPU: all of it, or a few glyphs while the GPU is still opening */
         few = wanted && left > 4 ? 4 : left;
+        t0 = wanted ? nb_now() : 0;
         for (i = done; i < done + few; i++) {
             rc = neuronte_coverage(b->cpu, list[i], b->cw, b->ch, 0, out + (size_t)(indirect ? b->miss_at[i] : i) * b->plane);
             if (rc != NEURONTE_OK)
                 return rc;
             b->from_cpu++;
         }
+        if (wanted)
+            cpu_worked(b, t0, nb_now());
         done += few;
     }
     return NEURONTE_OK;
+}
+
+void neuronte_backend_expect(neuronte_backend *b, int count)
+{
+    if (b)
+        b->expect = count > 0 ? count : 0;
 }
 
 void neuronte_backend_info(const neuronte_backend *cb, struct neuronte_backend_info *info)
@@ -621,6 +681,7 @@ void neuronte_backend_info(const neuronte_backend *cb, struct neuronte_backend_i
     snprintf(info->reason, sizeof info->reason, "%s", b->c.reason);
     if (!b->c.gpu)
         return;
+    look_at_power(b);
     pthread_mutex_lock(&b->mu);
     if (b->state == ST_LOST)
         snprintf(info->reason, sizeof info->reason, "%s", b->lost);
@@ -628,6 +689,7 @@ void neuronte_backend_info(const neuronte_backend *cb, struct neuronte_backend_i
         snprintf(info->reason, sizeof info->reason, "on battery");
     else {
         info->gpu = 1;
+        info->ready = b->state == ST_OPEN && !b->drop;
         info->min_glyphs = b->c.min_glyphs;
         snprintf(info->backend, sizeof info->backend, "%s", b->c.backend);
         snprintf(info->device, sizeof info->device, "%s", b->device[0] ? b->device : b->c.device);

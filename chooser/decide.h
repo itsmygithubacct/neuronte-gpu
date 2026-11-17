@@ -59,6 +59,25 @@ static double nb_least_ratio(const struct nb_decide_in *in, const struct nb_deci
     return least;
 }
 
+/* The name of a backend already measured that wins so clearly that no later one could change
+ * the choice: twice the margin, at every size timed, on every work, in every round. NULL when
+ * there is none. A later backend is then compared with the CPU but not timed. */
+static const char *nb_clear_winner(const struct nb_decide_in *in)
+{
+    int b, k, s;
+    for (b = 0; b < in->nbackends; b++) {
+        const struct nb_decide_backend *g = &in->backend[b];
+        int clear = g->exact && !g->draws_desktop && in->nworks > 0;
+        for (k = 0; k < in->nworks && clear; k++)
+            for (s = 0; s < NB_SIZES && clear; s++)
+                if (in->cpu1[k][s] > 0 && g->worst[k][s] < 2 * in->margin)
+                    clear = 0;
+        if (clear)
+            return g->name;
+    }
+    return NULL;
+}
+
 /* A backend is used from the smallest call size at which, and at every larger size, it is
  * `margin` times faster than one CPU thread on every work measured, in every round it was
  * timed in: a size that is in doubt stays with the CPU. A GPU that also draws the

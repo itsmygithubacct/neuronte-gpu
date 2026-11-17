@@ -89,6 +89,33 @@ int main(void)
         OK(out.chosen == -1 && out.min_glyphs == 0);
     }
 
+    /* a backend that wins every size by twice the margin in every round makes timing the next
+     * one pointless; one size short of that, a size not timed in rounds, a GPU that draws the
+     * desktop, or one differing byte, and the next one is timed */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    OK(nb_clear_winner(&in) == NULL);
+    one(&in, 0, 1152, (double[]){269, 370, 418, 442, 569}, 263);
+    {
+        struct nb_decide_backend *b = gpu(&in, "cuda", 1, 0, 0, (double[]){102, 42, 37, 33, 32});
+        OK(nb_clear_winner(&in) == NULL); /* not timed in rounds */
+        memcpy(b->worst[0], (double[]){2.64, 7.2, 7.9, 8.9, 10.3}, sizeof b->worst[0]);
+        OK(nb_clear_winner(&in) && !strcmp(nb_clear_winner(&in), "cuda"));
+        b->worst[0][0] = 2.55;
+        OK(nb_clear_winner(&in) == NULL);
+        b->worst[0][0] = 2.64;
+        b->draws_desktop = 1;
+        OK(nb_clear_winner(&in) == NULL);
+        b->draws_desktop = 0;
+        b->exact = 0;
+        OK(nb_clear_winner(&in) == NULL);
+        b->exact = 1;
+        in.cpu1[0][3] = -1; /* a size the file is too small for is not asked of it */
+        b->worst[0][3] = 0;
+        OK(nb_clear_winner(&in) != NULL);
+    }
+
     /* under the margin by a hair: the CPU */
     memset(&in, 0, sizeof in);
     in.margin = 1.3;

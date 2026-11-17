@@ -48,7 +48,17 @@ fast as one CPU thread on every file and size measured, in every one of the
 three rounds. That size is `min_glyphs`. A size that is in doubt therefore
 stays with the CPU. `backend.conf` records, for each size, the speed-up
 between the medians (`times_cpu`) and the least of the three rounds
-(`worst_round`), which is the one the choice is made on. A GPU that also draws the
+(`worst_round`), which is the one the choice is made on.
+
+Every backend in `backend.try` is compared with the CPU. A later one is
+timed only when no earlier one has already won every size by twice the
+margin in every round (`probe.NAME=... not timed: cuda wins every size`):
+it could not change the choice, and timing it is most of the step's cost.
+On the Quadro RTX 3000 this did not apply at the default margin: CUDA's
+least speed-up for one glyph was 2.2 to 2.6, under the 2.6 asked, so Vulkan
+was timed too and the step took 58 to 61 s on a busy machine (39 s with the
+timing skipped). `backend.try=cuda` leaves the second backend out
+altogether. A GPU that also draws the
 desktop is held to `backend.desktop_margin` (2) and to whole tables only.
 The first open, where a driver compiles kernels, is not counted against a
 GPU: step 40 pays it at setup.

@@ -448,7 +448,7 @@ static void clean(char *s)
 /* The child's work for one backend: open every work item, compare many calls with the CPU's
  * planes, time the sizes. It reports in key=value lines on `fd`. */
 static void probe_child(int fd, const char *lib_path, const char *backend, struct work *works, int nworks,
-                        int max_batch)
+                        int max_batch, int compare_only)
 {
     FILE *out = fdopen(fd, "w");
     struct gpu_lib g;
@@ -510,7 +510,7 @@ static void probe_child(int fd, const char *lib_path, const char *backend, struc
             }
         }
         fprintf(out, "soak.%d=%d %d\n", k, calls, differing);
-        {
+        if (!compare_only) {
             double gt[NSIZES][ROUNDS], ct[NSIZES][ROUNDS];
             neuronte *cpu = NULL;
             int r;
@@ -631,12 +631,13 @@ struct probe_arg {
     const char *lib, *backend;
     struct work *works;
     int nworks, max_batch;
+    int compare_only; /* compare with the CPU, do not time */
 };
 
 static void probe_entry(int fd, void *arg)
 {
     struct probe_arg *a = arg;
-    probe_child(fd, a->lib, a->backend, a->works, a->nworks, a->max_batch);
+    probe_child(fd, a->lib, a->backend, a->works, a->nworks, a->max_batch, a->compare_only);
 }
 
 /* Whether the GPU a backend found also drives a screen: a connected output on a graphics card
@@ -931,7 +932,8 @@ static int run_10(void)
         hard = nb_now() + atof(setting("backend.step_seconds", "150"));
         copy = strdup(setting("backend.try", "cuda,vulkan"));
         for (t = strtok_r(copy, ", ", &save); t && in.nbackends < NB_BACKENDS; t = strtok_r(NULL, ", ", &save)) {
-            struct probe_arg a = {lib, t, works, nworks, max_batch};
+            struct probe_arg a = {lib, t, works, nworks, max_batch, 0};
+            const char *winner = NULL;
             struct nb_decide_backend *b = &in.backend[in.nbackends];
             struct nb_kv kv;
             const char *err;
@@ -946,6 +948,11 @@ static int run_10(void)
                 nb_add(&m, "probe.%s=not tried: the step's time was used up\n", t);
                 continue;
             }
+            /* A later backend can only matter where an earlier one did not win clearly. Where one
+             * already beats twice the margin at every size in every round, this one is compared
+             * with the CPU as always but not timed. */
+            winner = nb_clear_winner(&in);
+            a.compare_only = winner != NULL;
             run_child(probe_entry, &a, atof(setting("backend.compile_seconds", "60")), atof(setting("backend.probe_seconds", "60")),
                       hard, &kv, &timed_out);
             err = nb_kv_get(&kv, "error", NULL);
@@ -953,6 +960,20 @@ static int run_10(void)
                 const char *what = timed_out ? "stopped: it did not finish in the time allowed" : err ? err : "its process ended early";
                 nb_add(&notes, "%s: %s; ", t, what);
                 nb_add(&m, "probe.%s=%s (%.1f s)\n", t, what, nb_now() - t0);
+                nb_kv_free(&kv);
+                continue;
+            }
+            if (winner) {
+                for (k = 0; k < nworks; k++) {
+                    char key[64];
+                    int a1 = 0, a2 = 1;
+                    snprintf(key, sizeof key, "soak.%d", k);
+                    sscanf(nb_kv_get(&kv, key, "0 1"), "%d %d", &a1, &a2);
+                    calls += a1;
+                    differing += a2;
+                }
+                nb_add(&m, "probe.%s=%s on %s; %d calls compared with the CPU, %d differing; not timed: %s wins every size (%.1f s)\n",
+                       t, nb_kv_get(&kv, "backend", t), nb_kv_get(&kv, "device", ""), calls, differing, winner, nb_now() - t0);
                 nb_kv_free(&kv);
                 continue;
             }

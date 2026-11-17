@@ -115,6 +115,8 @@ has "$S/backend.conf" "^battery=cpu" "on battery the CPU, unless set otherwise"
 has "$S/backend.conf" "^probe.cuda=.* 18 calls compared with the CPU, 0 differing" "the soak is recorded"
 has "$S/backend.conf" "^measure.cpu1.$NAME.8x16.bulk=" "the CPU's time is recorded"
 has "$S/backend.conf" "^measure.gpu-cuda.$NAME.8x16.single=" "the GPU's time is recorded"
+has "$S/backend.conf" "^measure.gpu-cuda.$NAME.8x16.single.worst_round=" "and its worst round against the CPU"
+has "$S/backend.conf" "^measure.load=" "and the machine's load"
 is 0 "current" "$TEN" check
 n=$(lines "$LOG")
 is 0 "run again when current" "$TEN" run

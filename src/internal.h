@@ -47,8 +47,13 @@ struct backend_ops {
     void (*close)(void *impl);
     /* count <= max_batch glyphs; writes count * plane floats to out */
     int (*run)(void *impl, const uint32_t *scalars, int count, float *out, struct neuronte_gpu_timing *t);
-    /* a file handle: runs the plan in g->v2 (see below) and writes count * plane floats to out */
+    /* a file handle: runs the plan in g->v2 (see below) and writes count * plane floats to out;
+     * with out NULL, where put is given, the pixels stay in the backend's output buffer */
     int (*run_plan)(void *impl, int count, float *out, struct neuronte_gpu_timing *t);
+    /* one glyph's plane, drawn on the host, into the backend's output buffer (NULL: not offered) */
+    int (*put)(void *impl, int glyph, const float *plane);
+    /* the name of the output buffer for the caller's own shaders (OpenGL), else 0 */
+    unsigned (*output)(void *impl);
 };
 
 /* ---- file handles: bundles, tiled nets, drawing files, any hidden width ----

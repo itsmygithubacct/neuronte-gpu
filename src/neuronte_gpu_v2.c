@@ -101,6 +101,7 @@ struct v2 {
     int ntriples, triples_cap;
     int *count, *start; /* per segment */
     int *cpu_list, ncpu;
+    float *spare; /* one plane, for a glyph the library draws on its way to the device */
     double *gx, *gy;
     /* text: coverage kept per scalar, an open-addressed table */
     uint32_t *kept_key; /* scalar + 1; 0 is empty */
@@ -1082,6 +1083,7 @@ void neuronte_gpu_v2_close(neuronte_gpu *g)
     free(v->count);
     free(v->start);
     free(v->cpu_list);
+    free(v->spare);
     free(v->gx);
     free(v->gy);
     free(v->kept_key);
@@ -1203,6 +1205,13 @@ int neuronte_gpu_v2_coverage(neuronte_gpu *g, const uint32_t *scalars, int count
     uint64_t t0 = neuronte_gpu_now(), c0;
     int i, j;
 
+    if (!out) {
+        /* the pixels stay on the device: one launch's worth, on a backend that can keep them */
+        if (g->backend != NEURONTE_GPU_OPENGL || !g->ops || !g->ops->put || count > g->max_batch)
+            return -1;
+        if (!v->spare && !(v->spare = malloc(plane * sizeof *v->spare)))
+            return -1;
+    }
     if (g->backend == NEURONTE_GPU_CPU || g->backend == NEURONTE_GPU_CPU_FALLBACK) {
         for (i = 0; i < count; i++)
             if (neuronte_coverage(v->cpu, scalars[i], g->cell_w, g->cell_h, g->samples, out + (size_t)i * plane) !=
@@ -1219,13 +1228,18 @@ int neuronte_gpu_v2_coverage(neuronte_gpu *g, const uint32_t *scalars, int count
             if (n <= 0)
                 return -1;
             t.plan += neuronte_gpu_now() - c0;
-            if (g->plan.npairs && g->ops->run_plan(g->impl, n, out + (size_t)i * plane, &part))
+            if (g->plan.npairs && g->ops->run_plan(g->impl, n, out ? out + (size_t)i * plane : NULL, &part))
                 return -1;
             c0 = neuronte_gpu_now();
-            for (j = 0; j < v->ncpu; j++)
-                if (neuronte_coverage(v->cpu, scalars[i + v->cpu_list[j]], g->cell_w, g->cell_h, g->samples,
-                                      out + (size_t)(i + v->cpu_list[j]) * plane) != NEURONTE_OK)
+            for (j = 0; j < v->ncpu; j++) {
+                /* drawn by the library: into the caller's array, or through `spare` into the device's */
+                float *to = out ? out + (size_t)(i + v->cpu_list[j]) * plane : v->spare;
+                if (neuronte_coverage(v->cpu, scalars[i + v->cpu_list[j]], g->cell_w, g->cell_h, g->samples, to) !=
+                    NEURONTE_OK)
                     return -1;
+                if (!out && g->ops->put(g->impl, v->cpu_list[j], to))
+                    return -1;
+            }
             t.cpu_eval += neuronte_gpu_now() - c0;
             t.upload += part.upload;
             t.run += part.run;
@@ -1242,6 +1256,18 @@ int neuronte_gpu_v2_coverage(neuronte_gpu *g, const uint32_t *scalars, int count
     if (timing)
         *timing = t;
     return 0;
+}
+
+int neuronte_gpu_coverage_device(neuronte_gpu *g, const uint32_t *scalars, int count, struct neuronte_gpu_timing *timing)
+{
+    if (!g || !g->v2 || !scalars || count < 1)
+        return -1;
+    return neuronte_gpu_v2_coverage(g, scalars, count, NULL, timing);
+}
+
+unsigned neuronte_gpu_gl_output(const neuronte_gpu *g)
+{
+    return g && g->v2 && g->backend == NEURONTE_GPU_OPENGL && g->ops && g->ops->output ? g->ops->output(g->impl) : 0;
 }
 
 int neuronte_gpu_set_untrained(neuronte_gpu *g, int mode)

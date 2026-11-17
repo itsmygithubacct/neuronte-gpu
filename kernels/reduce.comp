@@ -1,8 +1,8 @@
 // neuronte-gpu: pixels of the listed glyphs from the sample buffer, for Vulkan
 // and for OpenGL 4.3. Each pixel's samples are added row by row, as the CPU
 // library adds them, then divided by their number. One invocation per pixel.
-#ifndef GL
 layout(local_size_x = 64) in;
+#ifndef GL
 layout(push_constant) uniform Push {
     int count; // glyphs of the list this dispatch takes
     int cell_w;
@@ -10,12 +10,17 @@ layout(push_constant) uniform Push {
     int S;
     int first; // from this entry of the list
 } pc;
+#define P_COUNT pc.count
+#define P_CELL_W pc.cell_w
+#define P_CELL_H pc.cell_h
+#define P_S pc.S
+#define P_FIRST pc.first
 #else
-layout(local_size_x = 64) in;
-struct Push {
-    int count, cell_w, cell_h, S, first;
-};
-uniform Push pc;
+layout(location = 0) uniform int P_COUNT;
+layout(location = 1) uniform int P_CELL_W;
+layout(location = 2) uniform int P_CELL_H;
+layout(location = 3) uniform int P_S;
+layout(location = 4) uniform int P_FIRST;
 #endif
 
 layout(std430, binding = 4) writeonly buffer Out { float outv[]; };
@@ -24,15 +29,15 @@ layout(std430, binding = 7) readonly buffer List { uint list[]; };
 
 void main()
 {
-    const int plane = pc.cell_w * pc.cell_h;
+    const int plane = P_CELL_W * P_CELL_H;
     const int idx = int(gl_GlobalInvocationID.x);
-    if (idx >= pc.count * plane)
+    if (idx >= P_COUNT * plane)
         return;
     const int gi = idx / plane, pi = idx - gi * plane;
-    const int g = int(list[pc.first + gi]);
-    const int py = pi / pc.cell_w, px = pi - py * pc.cell_w;
-    const int S = pc.S, sw = pc.cell_w * S;
-    const int base = g * sw * pc.cell_h * S;
+    const int g = int(list[P_FIRST + gi]);
+    const int py = pi / P_CELL_W, px = pi - py * P_CELL_W;
+    const int S = P_S, sw = P_CELL_W * S;
+    const int base = g * sw * P_CELL_H * S;
     precise float acc = 0.0;
     for (int j = 0; j < S; j++)
         for (int i = 0; i < S; i++)

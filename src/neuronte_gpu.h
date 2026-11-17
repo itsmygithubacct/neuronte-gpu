@@ -146,6 +146,18 @@ int neuronte_gpu_draw_text(neuronte_gpu *g, uint32_t *pixels, int stride, int wi
                            int bold, int stroke_px, const char *text, size_t len, uint32_t color,
                            struct neuronte_gpu_timing *timing);
 
+/* OpenGL file handles: draw without bringing the pixels back. The coverage
+ * of the `count` glyphs (at most max_batch) is left in the handle's output
+ * buffer, count * cell_w * cell_h floats, glyph after glyph, rows from the
+ * top: a shader storage buffer whose name neuronte_gpu_gl_output returns,
+ * for the caller's own shaders to read (for instance into a glyph atlas).
+ * Glyphs the library draws on the host are copied into it. The buffer holds
+ * a call's glyphs until the next call. Returns 0, or -1 (also on any other
+ * backend). */
+int neuronte_gpu_coverage_device(neuronte_gpu *g, const uint32_t *scalars, int count,
+                                 struct neuronte_gpu_timing *timing);
+unsigned neuronte_gpu_gl_output(const neuronte_gpu *g);
+
 /* Device memory, in bytes. buffers: what this handle allocated on the device
  * (weights and tables, the batch's pairs and blocks, the output and, where
  * used, the sample buffer). weights: the part of buffers that is weights and

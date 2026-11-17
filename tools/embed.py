@@ -4,7 +4,8 @@
     embed.py OUT.c --ptx H=FILE ... --ptx2 KEY=FILE ... --spirv EXACT=FILE ... --glsl NAME=FILE ... [--opencl FILE]
 
 --spirv keys: 0 and 1, the single-net kernel (fast, exact); 10 and 11, the
-file-handle kernel; 20, the file handles' sample reduction. --glsl embeds
+file-handle kernel; 20, the file handles' sample reduction; 30 and 31, the
+file-handle kernel for OpenGL. --glsl embeds
 shader text for the OpenGL backend as neuronte_gpu_glsl_NAME.
 
 --ptx2 holds the file-handle kernels: KEY is the hidden width of a narrow

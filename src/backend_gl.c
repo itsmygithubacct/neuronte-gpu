@@ -50,6 +50,7 @@ typedef uint64_t GLuint64;
 #define GL_MAX_COMPUTE_WORK_GROUP_COUNT 0x91BE
 #define GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 0x90EB
 #define GL_MAX_COMPUTE_SHARED_MEMORY_SIZE 0x8262
+#define GL_SHADER_BINARY_FORMAT_SPIR_V 0x9551
 
 typedef void *EGLDisplay, *EGLConfig, *EGLContext, *EGLSurface, *EGLDeviceEXT;
 typedef int EGLint;
@@ -69,7 +70,7 @@ typedef unsigned EGLBoolean, EGLenum;
 enum { F_PARAMS, F_SEGS, F_MASKS, F_PAIRS, F_OUT, F_BLOCKS, F_SAMP, F_LIST };
 
 struct gl {
-    void *dl, *egl;
+    void *dl, *dl46, *egl;
     const GLubyte *(*GetString)(GLenum);
     void (*GetIntegerv)(GLenum, GLint *);
     void (*GetIntegeri_v)(GLenum, GLuint, GLint *);
@@ -87,7 +88,6 @@ struct gl {
     void (*DeleteShader)(GLuint);
     void (*DeleteProgram)(GLuint);
     void (*UseProgram)(GLuint);
-    GLint (*GetUniformLocation)(GLuint, const GLchar *);
     void (*Uniform1i)(GLint, GLint);
     void (*GenBuffers)(GLsizei, GLuint *);
     void (*DeleteBuffers)(GLsizei, const GLuint *);
@@ -104,6 +104,9 @@ struct gl {
     void (*BeginQuery)(GLenum, GLuint);
     void (*EndQuery)(GLenum);
     void (*GetQueryObjectui64v)(GLuint, GLenum, GLuint64 *);
+    /* OpenGL 4.6, absent before */
+    void (*ShaderBinary)(GLsizei, const GLuint *, GLenum, const void *, GLsizei);
+    void (*SpecializeShader)(GLuint, const GLchar *, GLuint, const GLuint *, const GLuint *);
     /* EGL, for a context of our own */
     EGLDisplay (*eGetDisplay)(void *);
     EGLDisplay (*eGetPlatformDisplay)(EGLenum, void *, const intptr_t *);
@@ -126,7 +129,6 @@ struct impl {
     GLuint buf[NBUF2];
     size_t size[NBUF2];
     GLuint *prog, reduce, query;
-    GLint (*loc)[4], rloc[5];
     GLint max_groups;
     double *rate, *work, slice_ns;
 };
@@ -166,7 +168,6 @@ static int load_gl(struct gl *gl, int own, char *why, size_t len)
     SYM(DeleteShader, "glDeleteShader");
     SYM(DeleteProgram, "glDeleteProgram");
     SYM(UseProgram, "glUseProgram");
-    SYM(GetUniformLocation, "glGetUniformLocation");
     SYM(Uniform1i, "glUniform1i");
     SYM(GenBuffers, "glGenBuffers");
     SYM(DeleteBuffers, "glDeleteBuffers");
@@ -184,6 +185,11 @@ static int load_gl(struct gl *gl, int own, char *why, size_t len)
     SYM(EndQuery, "glEndQuery");
     SYM(GetQueryObjectui64v, "glGetQueryObjectui64v");
 #undef SYM
+    *(void **)&gl->ShaderBinary = dlsym(gl->dl, "glShaderBinary");
+    *(void **)&gl->SpecializeShader = dlsym(gl->dl, "glSpecializeShader");
+    if (!gl->SpecializeShader && (gl->dl46 = dlopen("libGL.so.1", RTLD_NOW | RTLD_LOCAL)))
+        /* the vendor-neutral libOpenGL stops at 4.5; libGL of the same dispatch has the 4.6 entry */
+        *(void **)&gl->SpecializeShader = dlsym(gl->dl46, "glSpecializeShader");
     if (!own)
         return 0;
     gl->egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -342,20 +348,40 @@ static void impl_close(void *p)
         drop_context(m);
     if (gl->egl)
         dlclose(gl->egl);
+    if (gl->dl46)
+        dlclose(gl->dl46);
     if (gl->dl)
         dlclose(gl->dl);
     free(m->prog);
-    free(m->loc);
     free(m->rate);
     free(m->work);
     free(m);
+}
+
+static GLuint linked(struct impl *m, GLuint sh, char *why, size_t len)
+{
+    struct gl *gl = &m->gl;
+    GLuint prog = gl->CreateProgram();
+    GLint ok = 0;
+    char log[1024] = "";
+    gl->AttachShader(prog, sh);
+    gl->LinkProgram(prog);
+    gl->DeleteShader(sh);
+    gl->GetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        gl->GetProgramInfoLog(prog, sizeof log, NULL, log);
+        neuronte_gpu_say(why, len, "linking the compute shader failed: %.400s", log);
+        gl->DeleteProgram(prog);
+        return 0;
+    }
+    return prog;
 }
 
 static GLuint build(struct impl *m, const char *head, const char *body, char *why, size_t len)
 {
     struct gl *gl = &m->gl;
     const GLchar *src[2] = {head, body};
-    GLuint sh = gl->CreateShader(GL_COMPUTE_SHADER), prog;
+    GLuint sh = gl->CreateShader(GL_COMPUTE_SHADER);
     GLint ok = 0;
     char log[1024] = "";
     gl->ShaderSource(sh, 2, src, NULL);
@@ -367,17 +393,35 @@ static GLuint build(struct impl *m, const char *head, const char *body, char *wh
         gl->DeleteShader(sh);
         return 0;
     }
-    prog = gl->CreateProgram();
-    gl->AttachShader(prog, sh);
-    gl->LinkProgram(prog);
-    gl->DeleteShader(sh);
-    gl->GetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        gl->GetProgramInfoLog(prog, sizeof log, NULL, log);
-        neuronte_gpu_say(why, len, "linking the compute shader failed: %.400s", log);
-        gl->DeleteProgram(prog);
+    return linked(m, sh, why, len);
+}
+
+/* The kernel from SPIR-V, specialised as the Vulkan backend specialises it; 0 when the driver
+ * will not take it (the caller then compiles the text). */
+static GLuint build_spirv(struct impl *m, const struct embedded_spirv *spv, int threads, int h, int gp_max, int wide)
+{
+    struct gl *gl = &m->gl;
+    const GLuint idx[4] = {0, 1, 2, 3}, val[4] = {(GLuint)threads, (GLuint)h, (GLuint)gp_max, (GLuint)wide};
+    GLuint sh = gl->CreateShader(GL_COMPUTE_SHADER), prog;
+    GLint ok = 0;
+    char why[512] = "";
+    gl->ShaderBinary(1, &sh, GL_SHADER_BINARY_FORMAT_SPIR_V, spv->code, (GLsizei)(spv->words * sizeof(uint32_t)));
+    gl->SpecializeShader(sh, "main", 4, idx, val);
+    gl->GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok || gl->GetError() != 0) {
+        if (getenv("NEURONTE_GPU_DEBUG")) {
+            char log[1024] = "";
+            gl->GetShaderInfoLog(sh, sizeof log, NULL, log);
+            fprintf(stderr, "neuronte-gpu: the driver refused the SPIR-V kernel (%s); compiling the text\n", log);
+        }
+        while (gl->GetError() != 0)
+            ;
+        gl->DeleteShader(sh);
         return 0;
     }
+    prog = linked(m, sh, why, sizeof why);
+    if (!prog && getenv("NEURONTE_GPU_DEBUG"))
+        fprintf(stderr, "neuronte-gpu: the SPIR-V kernel did not link (%s); compiling the text\n", why);
     return prog;
 }
 
@@ -438,7 +482,8 @@ static int impl_run_plan(void *p, int count, float *out, struct neuronte_gpu_tim
     for (i = 0; i < NBUF2; i++)
         gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)i, m->buf[i]);
     t1 = neuronte_gpu_now();
-    gl->BeginQuery(GL_TIME_ELAPSED, m->query);
+    if (m->query)
+        gl->BeginQuery(GL_TIME_ELAPSED, m->query);
     for (k = 0; k < pl->nkern; k++) {
         const struct v2kern *kn = &pl->kern[k];
         uint64_t k0;
@@ -449,9 +494,9 @@ static int impl_run_plan(void *p, int count, float *out, struct neuronte_gpu_tim
         gl->Finish();
         k0 = neuronte_gpu_now();
         gl->UseProgram(m->prog[k]);
-        gl->Uniform1i(m->loc[k][1], g->cell_w);
-        gl->Uniform1i(m->loc[k][2], g->cell_h);
-        gl->Uniform1i(m->loc[k][3], g->samples);
+        gl->Uniform1i(1, g->cell_w);
+        gl->Uniform1i(2, g->cell_h);
+        gl->Uniform1i(3, g->samples);
         for (done = 0; done < kn->nblocks;) {
             /* a dispatch takes only as many blocks as should finish within the slice (see the
              * Vulkan backend): the display's own frames wait for a dispatch on the same device */
@@ -467,7 +512,7 @@ static int impl_run_plan(void *p, int count, float *out, struct neuronte_gpu_tim
                 cost += c;
                 n++;
             }
-            gl->Uniform1i(m->loc[k][0], kn->block0 + done);
+            gl->Uniform1i(0, kn->block0 + done);
             gl->DispatchCompute(n, 1, 1);
             done += (int)n;
             m->work[k] += cost;
@@ -485,25 +530,33 @@ static int impl_run_plan(void *p, int count, float *out, struct neuronte_gpu_tim
         int done;
         gl->MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         gl->UseProgram(m->reduce);
-        gl->Uniform1i(m->rloc[1], g->cell_w);
-        gl->Uniform1i(m->rloc[2], g->cell_h);
-        gl->Uniform1i(m->rloc[3], g->samples);
+        gl->Uniform1i(1, g->cell_w);
+        gl->Uniform1i(2, g->cell_h);
+        gl->Uniform1i(3, g->samples);
         for (done = 0; per && done < pl->nreduce;) {
             int n = (size_t)(pl->nreduce - done) < per ? pl->nreduce - done : (int)per;
-            gl->Uniform1i(m->rloc[0], n);
-            gl->Uniform1i(m->rloc[4], done);
+            gl->Uniform1i(0, n);
+            gl->Uniform1i(4, done);
             gl->DispatchCompute((GLuint)(((size_t)n * plane + 63) / 64), 1, 1);
             done += n;
             t->launches++;
         }
     }
-    gl->EndQuery(GL_TIME_ELAPSED);
-    gl->MemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-    gl->Finish();
+    if (m->query)
+        gl->EndQuery(GL_TIME_ELAPSED);
+    /* what follows may read the output with a shader, or as buffer data */
+    gl->MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+    if (out)
+        gl->Finish();
     t2 = neuronte_gpu_now();
-    gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, m->buf[F_OUT]);
-    gl->GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, out);
-    gl->GetQueryObjectui64v(m->query, GL_QUERY_RESULT, &ns);
+    if (out) {
+        gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, m->buf[F_OUT]);
+        gl->GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, out);
+    }
+    if (m->query)
+        gl->GetQueryObjectui64v(m->query, GL_QUERY_RESULT, &ns);
+    else
+        ns = t2 - t1;
     gl->UseProgram((GLuint)before);
     if (gl->GetError() != 0) {
         while (gl->GetError() != 0)
@@ -517,7 +570,22 @@ static int impl_run_plan(void *p, int count, float *out, struct neuronte_gpu_tim
     return 0;
 }
 
-static const struct backend_ops ops = {impl_close, NULL, impl_run_plan};
+static int impl_put(void *p, int glyph, const float *plane_data)
+{
+    struct impl *m = p;
+    struct gl *gl = &m->gl;
+    size_t plane = (size_t)m->g->cell_w * m->g->cell_h * sizeof(float);
+    gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, m->buf[F_OUT]);
+    gl->BufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)((size_t)glyph * plane), (GLsizeiptr)plane, plane_data);
+    return gl->GetError() != 0;
+}
+
+static unsigned impl_output(void *p)
+{
+    return ((struct impl *)p)->buf[F_OUT];
+}
+
+static const struct backend_ops ops = {impl_close, NULL, impl_run_plan, impl_put, impl_output};
 
 int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len)
 {
@@ -528,6 +596,7 @@ int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *op
     GLint major = 0, minor = 0, invocations = 0, shared = 0, before = 0;
     int k, nt = opt->block > 0 ? opt->block : 64;
     const char *renderer, *version, *tune;
+    const struct embedded_spirv *spv = NULL;
     char head[512], kinds[256] = "";
 
     if (!m)
@@ -543,6 +612,12 @@ int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *op
     version = (const char *)gl->GetString(GL_VERSION);
     if (!renderer || !version) {
         neuronte_gpu_say(why, len, "no OpenGL context is current on this thread");
+        goto fail;
+    }
+    if (!(opt->flags & NEURONTE_GPU_ALLOW_CPU_DEVICE) &&
+        (strcasestr(renderer, "llvmpipe") || strcasestr(renderer, "softpipe"))) {
+        /* a context drawn by the CPU would run the shader on the CPU, far slower than the library */
+        neuronte_gpu_say(why, len, "the OpenGL context is drawn by the CPU (%s)", renderer);
         goto fail;
     }
     gl->GetIntegerv(GL_MAJOR_VERSION, &major);
@@ -564,11 +639,21 @@ int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *op
     if (neuronte_gpu_v2_size(g, nt, nt, nt, 0, (size_t)shared / sizeof(float), why, len))
         goto fail;
     m->prog = calloc((size_t)pl->nkern + 1, sizeof *m->prog);
-    m->loc = calloc((size_t)pl->nkern + 1, sizeof *m->loc);
     m->rate = calloc((size_t)pl->nkern + 1, sizeof *m->rate);
     m->work = calloc((size_t)pl->nkern + 1, sizeof *m->work);
-    if (!m->prog || !m->loc || !m->rate || !m->work)
+    if (!m->prog || !m->rate || !m->work)
         goto fail;
+    /* The kernel can also be loaded as SPIR-V where OpenGL 4.6 allows, with every loop unrolled as in
+     * the Vulkan backend. Measured: about four times faster than the text on Mesa's Intel driver,
+     * about four times slower on NVIDIA's, and Mesa compiles it afresh at every open (many seconds)
+     * where it keeps compiled text in its cache. So it is used only when asked for. */
+    tune = getenv("NEURONTE_GPU_GL_SPIRV");
+    if (tune && atoi(tune) && (major > 4 || minor >= 6) && gl->ShaderBinary && gl->SpecializeShader)
+        for (k = 0; k < neuronte_gpu_spirv_count; k++)
+            if (neuronte_gpu_spirv[k].exact == 30 + g->exact)
+                spv = &neuronte_gpu_spirv[k];
+    if (getenv("NEURONTE_GPU_DEBUG"))
+        fprintf(stderr, "neuronte-gpu: opengl %d.%d, SPIR-V loader %s, kernel %s\n", major, minor, gl->ShaderBinary && gl->SpecializeShader ? "present" : "absent", spv ? "found" : "not chosen");
     tune = getenv("NEURONTE_GPU_SLICE_MS");
     m->slice_ns = (tune && atof(tune) > 0 ? atof(tune) : 25.0) * 1e6;
     for (k = 0; k < pl->nkern; k++) {
@@ -580,25 +665,22 @@ int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *op
                  "#version 430\n#define GL 1\n#define NT %d\n#define H %d\n#define GPMAX %d\n#define WIDE %d\n"
                  "#define EXACT %d\n",
                  kn->threads, h, kn->gp_max, kn->wide, g->exact);
-        m->prog[k] = build(m, head, neuronte_gpu_glsl_cover2, why, len);
+        if (spv)
+            m->prog[k] = build_spirv(m, spv, kn->threads, h, kn->gp_max, kn->wide);
+        if (!m->prog[k]) {
+            spv = NULL; /* this driver compiles the text */
+            m->prog[k] = build(m, head, neuronte_gpu_glsl_cover2, why, len);
+        }
         if (!m->prog[k])
             goto fail;
-        m->loc[k][0] = gl->GetUniformLocation(m->prog[k], "pc.block0");
-        m->loc[k][1] = gl->GetUniformLocation(m->prog[k], "pc.cell_w");
-        m->loc[k][2] = gl->GetUniformLocation(m->prog[k], "pc.cell_h");
-        m->loc[k][3] = gl->GetUniformLocation(m->prog[k], "pc.S");
         snprintf(kinds + used, sizeof kinds - used, "%s%s%d", used ? " " : "", kn->wide ? "wide" : "H", h);
     }
     m->reduce = build(m, "#version 430\n#define GL 1\n", neuronte_gpu_glsl_reduce, why, len);
     if (!m->reduce)
         goto fail;
-    m->rloc[0] = gl->GetUniformLocation(m->reduce, "pc.count");
-    m->rloc[1] = gl->GetUniformLocation(m->reduce, "pc.cell_w");
-    m->rloc[2] = gl->GetUniformLocation(m->reduce, "pc.cell_h");
-    m->rloc[3] = gl->GetUniformLocation(m->reduce, "pc.S");
-    m->rloc[4] = gl->GetUniformLocation(m->reduce, "pc.first");
     gl->GenBuffers(NBUF2, m->buf);
-    gl->GenQueries(1, &m->query);
+    if (m->own) /* a query belongs to one context; the caller's may be one of several that share objects */
+        gl->GenQueries(1, &m->query);
     store(m, F_PARAMS, pl->params_cap * sizeof(float), NULL, GL_STATIC_DRAW);
     gl->BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(pl->nstatic * sizeof(float)), pl->params);
     store(m, F_SEGS, (size_t)pl->segs_cap * S_INTS * sizeof(int32_t), NULL, GL_STATIC_DRAW);
@@ -620,8 +702,9 @@ int neuronte_gpu_gl_open2(neuronte_gpu *g, const struct neuronte_gpu_options *op
     }
     snprintf(g->device, sizeof g->device, "%s", renderer);
     snprintf(g->versions, sizeof g->versions,
-             "opengl %s; %s context; file handle: %d nets, %d segments, kernels %s", version,
-             m->own ? "own surfaceless EGL" : "the caller's", g->nmembers, pl->nstatic_segs, kinds);
+             "opengl %s; %s context; %s; file handle: %d nets, %d segments, kernels %s", version,
+             m->own ? "own surfaceless EGL" : "the caller's", spv ? "SPIR-V" : "GLSL text", g->nmembers,
+             pl->nstatic_segs, kinds);
     g->device_type = strcasestr(renderer, "llvmpipe") || strcasestr(renderer, "softpipe") ? "cpu"
                      : strcasestr(renderer, "Intel") ? "integrated-gpu" : "gpu";
     g->ops = &ops;

@@ -1,7 +1,7 @@
 /* neuronte_gpu_atlas: ways to get Neuronte glyphs into a terminal's glyph atlas, compared.
  *
  *   neuronte_gpu_atlas --nrt FILE.nrt --cell WxH --scalars LIST [--device NAME]
- *                      [--paths cpu,device,gl,gl-direct] [--repeats N] [--ask MAJOR.MINOR]
+ *                      [--paths cpu,device,gl,gl-direct] [--repeats N] [--ask MAJOR.MINOR] [--leave-atlas]
  *                      [--device-backend auto|cuda|vulkan] [--device-name NAME]
  *
  * The program stands in for a terminal that draws with OpenGL: it makes a
@@ -91,6 +91,7 @@ static int read_scalars(const char *path, uint32_t **out)
 /* ---- the stand-in terminal ---- */
 
 static int cw, ch, xnum, ynum, count, grid_cols, grid_rows;
+static int leave_atlas; /* --leave-atlas: do not clear new atlas storage (shows what a driver leaves in it) */
 static uint32_t *scalars;
 static GLuint atlas, scratch, frame_fbo, frame_tex, frame_prog, blit_prog, vao;
 static int gl_major, gl_minor, ask_major = 3, ask_minor = 3;
@@ -183,6 +184,16 @@ static GLuint new_atlas(GLenum format)
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, format, xnum * cw, ynum * (ch + 1), 1);
+    if (!leave_atlas) {
+        /* new storage holds whatever the driver left there; the glyph paths write only each
+         * sprite's cw x ch, so the spare row under each sprite and the unused sprites of the
+         * last row must be given a value before atlases are compared */
+        size_t n = (size_t)xnum * cw * ynum * (ch + 1) * 4;
+        unsigned char *zero = calloc(n, 1);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, xnum * cw, ynum * (ch + 1), 1, GL_RGBA, GL_UNSIGNED_BYTE, zero);
+        free(zero);
+    }
     return t;
 }
 
@@ -322,6 +333,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
         else if (!strcmp(argv[i], "--paths") && i + 1 < argc) paths = argv[++i];
         else if (!strcmp(argv[i], "--repeats") && i + 1 < argc) repeats = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--leave-atlas")) leave_atlas = 1;
         else if (!strcmp(argv[i], "--cell") && i + 1 < argc && sscanf(argv[i + 1], "%dx%d", &cw, &ch) == 2) i++;
         else if (!strcmp(argv[i], "--ask") && i + 1 < argc && sscanf(argv[i + 1], "%d.%d", &ask_major, &ask_minor) == 2) i++;
         else if (!strcmp(argv[i], "--device-backend") && i + 1 < argc) dev_backend = argv[++i];
@@ -366,7 +378,7 @@ int main(int argc, char **argv)
         struct neuronte_gpu_memory mem = {0};
         uint64_t open_ns, first_ns, all[64], frame[64];
         int same = -1, worst = 0;
-        size_t differing = 0, first_differing = 0;
+        size_t differing = 0, first_differing = 0, differing_in_glyphs = 0;
         {
             /* the path is run when its name is one of the comma-separated words */
             const char *q = paths;
@@ -450,6 +462,13 @@ int main(int argc, char **argv)
             for (b = 0; b < atlas_bytes; b++)
                 if (reference[b] != got[b]) {
                     int d = abs((int)reference[b] - (int)got[b]);
+                    {
+                        /* inside a sprite some path wrote, or in the storage none of them writes */
+                        size_t px = b / 4, x = px % ((size_t)xnum * cw), y = px / ((size_t)xnum * cw);
+                        size_t slot = y / (size_t)(ch + 1) * (size_t)xnum + x / (size_t)cw;
+                        if (y % (size_t)(ch + 1) < (size_t)ch && slot < (size_t)count)
+                            differing_in_glyphs++;
+                    }
                     if (!differing++)
                         first_differing = b;
                     if (d > worst)
@@ -458,12 +477,14 @@ int main(int argc, char **argv)
         }
         printf("{\"path\":\"%s\",\"backend\":\"%s\",\"device\":\"%s\",\"open_ns\":%llu,\"first_glyph_ns\":%llu,"
                "\"all_glyphs_ns\":%llu,\"per_glyph_ns\":%llu,\"frame_with_all_new_ns\":%llu,"
-               "\"atlas_equals_cpu\":%s,\"differing_bytes\":%zu,\"largest_difference\":%d,\"first_differing_byte\":%zu,"
+               "\"atlas_equals_cpu\":%s,\"differing_bytes\":%zu,\"differing_bytes_in_glyphs\":%zu,\"atlas_cleared\":%s,"
+               "\"largest_difference\":%d,\"first_differing_byte\":%zu,"
                "\"atlas_bytes\":%zu,\"buffers\":%zu,\"weights\":%zu,\"gl_error\":%u}\n",
                path_name[kind], p.gpu ? neuronte_gpu_backend_name(neuronte_gpu_backend(p.gpu)) : "cpu-library",
                p.gpu ? neuronte_gpu_device(p.gpu) : "", (unsigned long long)open_ns, (unsigned long long)first_ns,
                (unsigned long long)median(all, repeats), (unsigned long long)(median(all, repeats) / (uint64_t)count),
-               (unsigned long long)median(frame, repeats), same < 0 ? "null" : same ? "true" : "false", differing, worst,
+               (unsigned long long)median(frame, repeats), same < 0 ? "null" : same ? "true" : "false", differing, differing_in_glyphs,
+               leave_atlas ? "false" : "true", worst,
                first_differing, (size_t)atlas_bytes, mem.buffers,
                mem.weights, glGetError());
         fflush(stdout);

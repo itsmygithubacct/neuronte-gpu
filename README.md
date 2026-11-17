@@ -134,7 +134,9 @@ OpenCL backend is always built; it needs no headers or SDK. `CUDA=0`
 leaves out the CUDA kernels; `HIDDEN="4 12 48"` limits the widths compiled
 (default 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64).
 
-Outputs: `build/libneuronte_gpu.a` and `build/neuronte_gpu_bench`.
+Outputs: `build/libneuronte_gpu.a`, `build/neuronte_gpu_bench` and the tools
+listed under "Whole Neuronte files". The OpenGL backend needs no headers
+or SDK; it loads EGL and OpenGL at run time.
 
 ## Using it
 
@@ -205,6 +207,109 @@ Mali GPUs) at start, at the start of measurement and at the end. The coverage
 dump is in scalar order, for comparison with the CPU. `--backend` is `auto`,
 `cuda`, `vulkan`, `opencl` or `cpu`.
 
+## Whole Neuronte files
+
+The single-net path above draws one distance net, or a layout of nets of one
+hidden width. A *file handle* draws any file the reference library opens that
+holds distance nets: a bundle (the library's own router sends each character
+to one of its nets), a tiled net, a drawing file with its letter edge table,
+and nets of any hidden width up to 1,024. It is taken by itself for every
+file that is not one narrow net, and for that too with `NEURONTE_GPU_FILE`.
+
+```c
+struct neuronte_gpu_options opt = {0};
+opt.nrt_path = "neuronte-split-v9.nrt";
+opt.cell_w = 8;
+opt.cell_h = 16;
+opt.max_batch = 256;                 /* the most characters in one call */
+opt.flags = NEURONTE_GPU_FILE;
+```
+
+`neuronte_gpu_coverage` is the same call. Routing, the answer to "is this
+character trained", the mark drawn for an untrained one and colour nets
+(emoji, icons) are the reference library's own, run on the host and counted
+in the timing as `cpu_glyphs` and `marks`. The floats are those of
+`neuronte_coverage`, bit for bit.
+
+Backends for file handles: CUDA (one kernel per hidden width up to 64, one
+"wide" kernel family above), Vulkan (one compute shader) and OpenGL 4.3
+compute (`NEURONTE_GPU_OPENGL`, only when asked for by name). OpenCL does
+not take file handles. An OpenGL handle makes a surfaceless EGL context of
+its own, or with `NEURONTE_GPU_GL_CURRENT` uses the context current on the
+calling thread; `neuronte_gpu_coverage_device` then leaves the pixels in a
+shader storage buffer (`neuronte_gpu_gl_output`) for the caller's own
+shaders. `neuronte_gpu_memory` reports what a handle holds on the device.
+All handles of a process on one CUDA device share one context.
+
+On a GPU that also draws the desktop a compute dispatch cannot be
+preempted, so Vulkan and OpenGL cut a launch into dispatches of about 25 ms
+(`NEURONTE_GPU_SLICE_MS`). An OpenGL context that a CPU draws (llvmpipe) is
+refused unless `NEURONTE_GPU_ALLOW_CPU_DEVICE` is given: two glyphs took
+327 s there.
+
+### Measured
+
+Core i7-6820HQ with a Quadro M2000M, CUDA, the machine otherwise idle, exact
+mode, microseconds per glyph for a file's whole character set in one call
+(in brackets the set), against the reference library on the same machine:
+
+| File (characters) | Cell | GPU | CPU, one core | CPU, 8 threads |
+|---|---|---:|---:|---:|
+| `neuronte-split-v9` (1,341) | 8x16 | 225.7 (303 ms) | 354.4 | 88.2 |
+| | 16x32 | 906.2 (1,215 ms) | 1,364.0 | 346.5 |
+| `neuronte-term-latin-v1` (596) | 8x16 | 91.0 (54 ms) | 189.6 | 44.3 |
+| | 16x32 | 367.1 (219 ms) | 734.0 | 171.7 |
+| `neuronte-ui14-v1` (96) | 14x28 | 3.93 (0.38 ms) | 231.3 | 41.3 |
+| scaled desktop face (154) | 14x28 | 593.3 (91 ms) | 1,000.9 | 226.4 |
+
+Core i7-9850H with a Quadro RTX 3000, CUDA, the CPU loaded by other work
+(load average 21): `neuronte-split-v9` 34.5 / 80.6 / 139.3 us per glyph at
+8x16 / 12x24 / 16x32 (the set in 46 / 108 / 187 ms), against 617.7 /
+1,187 / 2,168 on one loaded thread. Time per glyph falls with the size of
+the call: 144 us for one glyph, 77 for 16, 63 for 256, 34.7 for 1,024.
+
+A call for one glyph costs 280 to 520 us on the Quadro M2000M and 97 to 168
+on the Quadro RTX 3000, so a GPU pays for tables and lines, not single
+letters.
+
+Device memory of the process, CUDA, calls of up to 256 glyphs: the context
+alone is about 29 MiB on the Quadro M2000M and 86 MiB on the Quadro RTX
+3000; `neuronte-split-v9` at 8x16 adds about 4 MiB; 38 files of the v2 set
+open together take 88.5 MiB at 8x16 and 154.1 MiB at 16x32 on the Quadro
+M2000M.
+
+The first open for a user compiles the kernels (12.5 s for
+`neuronte-split-v9` on the Quadro M2000M); the driver keeps them, and the
+next open takes 0.09 s. The driver does not use a cache directory it cannot
+write.
+
+Power on the Quadro RTX 3000, read from the driver every 0.2 s: 5.8 W idle;
+any call, however small, holds it at about 31 W for about 17 s; whole
+tables back to back 77 W. One table of 1,341 glyphs at 8x16 took 3.2 J.
+
+Exactness on the Quadro M2000M with CUDA: 11 terminal bundles at three cell
+sizes with and without the untrained mark, 38 files of the v2 set at four
+sizes, and hidden widths up to 1,024: 242 of 242 identical, for the first
+call and a later one.
+
+### Tools
+
+- `tools/exact.py` compares files and cell sizes with the CPU library,
+  the first call and the last.
+- `build/neuronte_gpu_soak` compares many calls of changing size.
+- `tools/measure.py` times a file's whole set and single glyphs against
+  the CPU library on one thread and all threads.
+- `build/neuronte_gpu_text` draws a line of text from a drawing file.
+- `build/neuronte_gpu_mem` reports device memory per file and in total.
+- `tools/sweep.py` gives time per glyph against glyphs per call.
+- `tools/power.py` samples an NVIDIA GPU's power during work.
+- `build/neuronte_colour_cost` times what the CPU library pays per
+  character, colour files included.
+- `make build/neuronte_gpu_atlas` builds a harness that fills a terminal's
+  glyph atlas by the CPU library, by a separate device context and by a
+  compute shader in the terminal's own context, and compares them.
+- `make build/libneuronte_gpu.so` builds a shared library.
+
 ## Arm Mali
 
 Measured on Rockchip boards running Arm's kernel driver (kbase) with
@@ -249,9 +354,11 @@ Notes:
 
 ## Limits
 
-- One hidden width per model set on the GPU (mixed widths use the CPU).
-- CUDA: the compiled hidden widths; Vulkan and OpenCL: hidden widths up
-  to 64.
+- The single-net path: one hidden width per model set on the GPU (mixed
+  widths use the CPU); CUDA: the compiled hidden widths; Vulkan and
+  OpenCL: hidden widths up to 64. File handles have neither limit.
+- File handles: colour nets are drawn by the reference library on the
+  host; OpenCL does not take them; OpenGL needs 4.3.
 - Compute capability 5.0 or later for CUDA; Vulkan 1.1 for Vulkan; OpenCL
   1.2 for OpenCL.
 - The OpenCL kernel is compiled at every open where the driver keeps no

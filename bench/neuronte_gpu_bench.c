@@ -68,7 +68,16 @@ static struct {
     int (*power)(nvmlDevice_t, unsigned *);
     int (*util)(nvmlDevice_t, nvml_util *);
     int (*pstate)(nvmlDevice_t, int *);
+    int (*energy)(nvmlDevice_t, unsigned long long *);
+    int (*procs)(nvmlDevice_t, unsigned *, void *);
 } nv;
+
+/* nvmlProcessInfo_t of nvmlDeviceGetComputeRunningProcesses_v3 */
+struct nvml_proc {
+    unsigned pid;
+    unsigned long long used;
+    unsigned gpu_instance, compute_instance;
+};
 
 static void nvml_load(void)
 {
@@ -87,6 +96,8 @@ static void nvml_load(void)
     *(void **)&nv.power = dlsym(dl, "nvmlDeviceGetPowerUsage");
     *(void **)&nv.util = dlsym(dl, "nvmlDeviceGetUtilizationRates");
     *(void **)&nv.pstate = dlsym(dl, "nvmlDeviceGetPerformanceState");
+    *(void **)&nv.energy = dlsym(dl, "nvmlDeviceGetTotalEnergyConsumption");
+    *(void **)&nv.procs = dlsym(dl, "nvmlDeviceGetComputeRunningProcesses_v3");
     if (init && nv.count_fn && nv.handle && init() == 0 && nv.count_fn(&nv.count) == 0)
         nv.ok = 1;
 }
@@ -168,12 +179,84 @@ static void snapshot(FILE *out, int cpu)
             nv.util(dev, &u);
         if (nv.pstate)
             nv.pstate(dev, &ps);
+        /* the device's energy counter in millijoules, where the driver keeps one; 0 otherwise */
+        unsigned long long mj = 0;
+        if (nv.energy && nv.energy(dev, &mj))
+            mj = 0;
         fprintf(out,
                 "%s{\"name\":\"%s\",\"temp_c\":%u,\"sm_mhz\":%u,\"mem_mhz\":%u,\"power_mw\":%u,"
-                "\"util_gpu\":%u,\"util_mem\":%u,\"pstate\":%d}",
-                d ? "," : "", name, temp, sm, mem, mw, u.gpu, u.memory, ps);
+                "\"util_gpu\":%u,\"util_mem\":%u,\"pstate\":%d,\"energy_mj\":%llu}",
+                d ? "," : "", name, temp, sm, mem, mw, u.gpu, u.memory, ps, mj);
     }
-    fprintf(out, "]}");
+    fprintf(out, "]");
+    {
+        char bat[64], ac[64];
+        read_text("/sys/class/power_supply/BAT0/capacity", bat, sizeof bat);
+        read_text("/sys/class/power_supply/AC/online", ac, sizeof ac);
+        if (!ac[0])
+            read_text("/sys/class/power_supply/AC0/online", ac, sizeof ac);
+        if (!ac[0])
+            read_text("/sys/class/power_supply/ADP1/online", ac, sizeof ac);
+        fprintf(out, ",\"battery_percent\":\"%s\",\"ac_online\":\"%s\"}", bat, ac);
+    }
+}
+
+/* Device memory this process holds on any NVIDIA GPU, in bytes, as the driver reports it; 0 when
+ * it does not. */
+static unsigned long long nvml_process_bytes(void)
+{
+    unsigned long long sum = 0;
+    if (!nv.tried)
+        nvml_load();
+    for (unsigned d = 0; nv.ok && nv.procs && d < nv.count; d++) {
+        nvmlDevice_t dev;
+        struct nvml_proc pr[64];
+        unsigned n = 64;
+        if (nv.handle(d, &dev) || nv.procs(dev, &n, pr))
+            continue;
+        for (unsigned i = 0; i < n && i < 64; i++)
+            if (pr[i].pid == (unsigned)getpid() && pr[i].used != ~0ull)
+                sum += pr[i].used;
+    }
+    return sum;
+}
+
+static void memory_json(FILE *o, const char *key, const neuronte_gpu *g)
+{
+    struct neuronte_gpu_memory m = {0};
+    neuronte_gpu_memory(g, &m);
+    fprintf(o, ",\"%s\":{\"process_device_bytes\":%llu,\"buffers\":%zu,\"weights\":%zu,\"staging\":%zu,"
+            "\"driver_measured\":%zu}",
+            key, nvml_process_bytes(), m.buffers, m.weights, m.staging, m.measured);
+}
+
+/* Scalars from a text file: one per line, as U+XXXX, 0x... or decimal. */
+static int read_scalars(const char *path, uint32_t **out)
+{
+    FILE *f = fopen(path, "r");
+    char line[128];
+    int n = 0, cap = 0;
+    uint32_t *v = NULL;
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof line, f)) {
+        char *q = line;
+        while (*q == ' ' || *q == '\t')
+            q++;
+        if (!*q || *q == '\n' || *q == '#')
+            continue;
+        if (n == cap) {
+            cap = cap ? cap * 2 : 256;
+            v = realloc(v, (size_t)cap * sizeof *v);
+            if (!v)
+                return -1;
+        }
+        v[n++] = (q[0] == 'U' || q[0] == 'u') && q[1] == '+' ? (uint32_t)strtoul(q + 2, NULL, 16)
+                                                             : (uint32_t)strtoul(q, NULL, 0);
+    }
+    fclose(f);
+    *out = v;
+    return n;
 }
 
 static void shuffle(uint32_t *v, int n, uint64_t seed)
@@ -193,8 +276,8 @@ static void usage(void)
     fprintf(stderr,
             "usage: neuronte_gpu_bench (--layout FILE [--models DIR] | --nrt FILE --cell WxH)\n"
             "       [--backend auto|cuda|vulkan|opencl|cpu] [--device NAME] [--fast] [--no-fallback]\n"
-            "       [--allow-cpu-device] [--shared-weights] [--samples S] [--block N] [--max-batch N] [--cpu K]\n"
-            "       [--first SCALAR] [--count N] [--per-call N]\n"
+            "       [--allow-cpu-device] [--shared-weights] [--file-handle] [--samples S] [--block N] [--max-batch N] [--cpu K]\n"
+            "       [--first SCALAR] [--count N] [--scalars FILE] [--per-call N] [--untrained 0|1] [--snap PX]\n"
             "       [--warmup-ms MS] [--warmup N] [--repeats N] [--passes N] [--single N] [--seed N] [--coverage-out FILE]\n");
     exit(2);
 }
@@ -208,10 +291,10 @@ static void timing_json(FILE *o, const struct neuronte_gpu_timing *t)
 {
     fprintf(o,
             "{\"upload\":%llu,\"run\":%llu,\"wait\":%llu,\"download\":%llu,\"cpu_eval\":%llu,\"total\":%llu,"
-            "\"launches\":%d,\"cpu_glyphs\":%d}",
+            "\"launches\":%d,\"cpu_glyphs\":%d,\"plan\":%llu,\"marks\":%d,\"warped\":%d}",
             (unsigned long long)t->upload, (unsigned long long)t->run, (unsigned long long)t->wait,
             (unsigned long long)t->download, (unsigned long long)t->cpu_eval, (unsigned long long)t->total,
-            t->launches, t->cpu_glyphs);
+            t->launches, t->cpu_glyphs, (unsigned long long)t->plan, t->marks, t->warped);
 }
 
 static void add(struct neuronte_gpu_timing *a, const struct neuronte_gpu_timing *b)
@@ -224,12 +307,17 @@ static void add(struct neuronte_gpu_timing *a, const struct neuronte_gpu_timing 
     a->total += b->total;
     a->launches += b->launches;
     a->cpu_glyphs += b->cpu_glyphs;
+    a->plan += b->plan;
+    a->marks += b->marks;
+    a->warped += b->warped;
 }
 
 int main(int argc, char **argv)
 {
     struct neuronte_gpu_options opt = {0};
-    const char *backend = "auto", *coverage_out = NULL;
+    const char *backend = "auto", *coverage_out = NULL, *scalars_path = NULL;
+    int untrained = -1, snap = -2;
+    uint32_t *listed = NULL;
     int warmup = 1, warmup_ms = 0, warmup_calls = 0, repeats = 10, passes = 4, single = 0, cpu = -1, count = 256, per_call = 0, i, p, r;
     uint32_t first = 0x2800;
     uint64_t seed = 1;
@@ -251,6 +339,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--no-fallback")) opt.flags &= ~NEURONTE_GPU_ALLOW_FALLBACK;
         else if (!strcmp(argv[i], "--allow-cpu-device")) opt.flags |= NEURONTE_GPU_ALLOW_CPU_DEVICE;
         else if (!strcmp(argv[i], "--shared-weights")) opt.flags |= NEURONTE_GPU_SHARED_WEIGHTS;
+        else if (!strcmp(argv[i], "--file-handle")) opt.flags |= NEURONTE_GPU_FILE;
         else if (!strcmp(argv[i], "--samples")) opt.samples = atoi(ARG());
         else if (!strcmp(argv[i], "--block")) opt.block = atoi(ARG());
         else if (!strcmp(argv[i], "--max-batch")) opt.max_batch = atoi(ARG());
@@ -258,6 +347,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--first")) first = (uint32_t)strtoul(ARG(), NULL, 0);
         else if (!strcmp(argv[i], "--count")) count = atoi(ARG());
         else if (!strcmp(argv[i], "--per-call")) per_call = atoi(ARG());
+        else if (!strcmp(argv[i], "--scalars")) scalars_path = ARG();
+        else if (!strcmp(argv[i], "--untrained")) untrained = atoi(ARG());
+        else if (!strcmp(argv[i], "--snap")) snap = atoi(ARG());
         else if (!strcmp(argv[i], "--warmup")) warmup = atoi(ARG());
         else if (!strcmp(argv[i], "--warmup-ms")) warmup_ms = atoi(ARG());
         else if (!strcmp(argv[i], "--repeats")) repeats = atoi(ARG());
@@ -271,6 +363,10 @@ int main(int argc, char **argv)
     if ((!opt.layout_path && !opt.nrt_path) || warmup < 0 || warmup_ms < 0 || repeats < 1 || repeats > MAX_ROUNDS || passes < 1 ||
         single < 0 || count < 1 || per_call < 0)
         usage();
+    if (scalars_path && (count = read_scalars(scalars_path, &listed)) < 1) {
+        fprintf(stderr, "cannot read scalars from %s\n", scalars_path);
+        return 1;
+    }
     if (!per_call)
         per_call = count;
     if (!strcmp(backend, "auto")) opt.backend = NEURONTE_GPU_AUTO;
@@ -337,6 +433,11 @@ int main(int argc, char **argv)
                 neuronte_gpu_tiles(g), neuronte_gpu_exact(g) ? "true" : "false");
     }
     fprintf(o, ",\"open_ns\":%llu,\"open_cpu_ns\":%llu", (unsigned long long)open_wall, (unsigned long long)open_cpu);
+    memory_json(o, "memory_open", g);
+    if ((untrained >= 0 && neuronte_gpu_set_untrained(g, untrained)) || (snap > -2 && neuronte_gpu_set_snap(g, snap))) {
+        fprintf(o, ",\"error\":\"--untrained and --snap need a file handle\"}\n");
+        return 1;
+    }
 
     size_t plane = (size_t)cw * (size_t)ch;
     uint32_t *corpus = malloc((size_t)count * sizeof *corpus);
@@ -346,7 +447,7 @@ int main(int argc, char **argv)
     if (!corpus || !call || !out || !rounds)
         return 1;
     for (i = 0; i < count; i++)
-        corpus[i] = first + (uint32_t)i;
+        corpus[i] = listed ? listed[i] : first + (uint32_t)i;
     shuffle(corpus, count, seed);
     for (i = 0; i < per_call; i++)
         call[i] = corpus[i % count];
@@ -363,6 +464,12 @@ int main(int argc, char **argv)
             (unsigned long long)(clock_ns(CLOCK_PROCESS_CPUTIME_ID) - c0));
     timing_json(o, &t);
     fprintf(o, "}");
+    memory_json(o, "memory_first_call", g);
+    /* the first call's rasters, to compare with the last call's below */
+    float *first_out = malloc(plane * (size_t)per_call * sizeof *first_out);
+    if (!first_out)
+        return 1;
+    memcpy(first_out, out, plane * (size_t)per_call * sizeof *first_out);
 
     if (warmup_ms > 0) {
         uint64_t end = clock_ns(CLOCK_MONOTONIC) + (uint64_t)warmup_ms * 1000000u;
@@ -413,13 +520,16 @@ int main(int argc, char **argv)
         free(one);
     }
 
+    fprintf(o, ",\"first_call_equals_last\":%s",
+            memcmp(first_out, out, plane * (size_t)per_call * sizeof *out) == 0 ? "true" : "false");
+    free(first_out);
     if (coverage_out) {
         /* one raster per corpus scalar, in scalar order */
         FILE *f = fopen(coverage_out, "wb");
         int ok = f != NULL;
         for (i = 0; ok && i < count; i++) {
             int k;
-            for (k = 0; k < per_call && call[k] != first + (uint32_t)i; k++)
+            for (k = 0; k < per_call && call[k] != (listed ? listed[i] : first + (uint32_t)i); k++)
                 ;
             ok = k < per_call && fwrite(out + (size_t)k * plane, sizeof *out, plane, f) == plane;
         }

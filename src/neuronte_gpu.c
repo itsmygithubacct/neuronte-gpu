@@ -68,7 +68,7 @@ static size_t net_floats(size_t h)
     return h * IN + h + 2 * (h * h + h) + h + 1;
 }
 
-static unsigned char *read_file(const char *path, size_t *len)
+unsigned char *neuronte_gpu_read_file(const char *path, size_t *len)
 {
     FILE *f = fopen(path, "rb");
     unsigned char *buf = NULL;
@@ -86,7 +86,7 @@ static unsigned char *read_file(const char *path, size_t *len)
     return buf;
 }
 
-static int parse_net(const unsigned char *p, size_t len, struct net *n, char *why, size_t wl)
+int neuronte_gpu_parse_net(const unsigned char *p, size_t len, struct net *n, char *why, size_t wl)
 {
     size_t i, count;
     uint32_t h;
@@ -189,7 +189,7 @@ bad:
 static int load_tile(neuronte_gpu *g, struct gtile *t, char *why, size_t wl)
 {
     size_t len, off = 0, sub;
-    unsigned char *data = read_file(t->file, &len);
+    unsigned char *data = neuronte_gpu_read_file(t->file, &len);
     int rc;
     if (!data) {
         neuronte_gpu_say(why, wl, "cannot read %s: %s", t->file, strerror(errno));
@@ -207,7 +207,7 @@ static int load_tile(neuronte_gpu *g, struct gtile *t, char *why, size_t wl)
             return -1;
         }
     }
-    rc = parse_net(data + off, sub, &t->net, why, wl);
+    rc = neuronte_gpu_parse_net(data + off, sub, &t->net, why, wl);
     free(data);
     if (rc)
         return -1;
@@ -492,6 +492,7 @@ void neuronte_gpu_close(neuronte_gpu *g)
         return;
     if (g->ops && g->impl)
         g->ops->close(g->impl);
+    neuronte_gpu_v2_close(g);
     free_tiles(g);
     free(g->pk.params);
     free(g->cpu_buf);
@@ -516,6 +517,12 @@ int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out
     g->exact = !(opt->flags & NEURONTE_GPU_FAST);
     g->max_batch = opt->max_batch > 0 ? opt->max_batch : DEFAULT_BATCH;
     g->device_type = "";
+    if (!opt->layout_path && neuronte_gpu_v2_wanted(opt->nrt_path, opt->flags)) {
+        if (neuronte_gpu_v2_open(g, opt, reason, reason_len))
+            goto fail;
+        *out = g;
+        return 0;
+    }
     if (opt->layout_path) {
         if (read_layout(g, opt, reason, reason_len))
             goto fail;
@@ -617,8 +624,20 @@ const char *neuronte_gpu_versions(const neuronte_gpu *g) { return g ? g->version
 const char *neuronte_gpu_device_type(const neuronte_gpu *g) { return g ? g->device_type : ""; }
 int neuronte_gpu_samples(const neuronte_gpu *g) { return g ? g->samples : 0; }
 int neuronte_gpu_hidden(const neuronte_gpu *g) { return g ? g->hidden : 0; }
-int neuronte_gpu_tiles(const neuronte_gpu *g) { return g ? g->ntiles : 0; }
+int neuronte_gpu_tiles(const neuronte_gpu *g) { return !g ? 0 : g->v2 ? g->nmembers : g->ntiles; }
 int neuronte_gpu_exact(const neuronte_gpu *g) { return g ? g->exact : 0; }
+
+int neuronte_gpu_memory(const neuronte_gpu *g, struct neuronte_gpu_memory *m)
+{
+    if (!g || !m)
+        return -1;
+    m->buffers = g->device_bytes;
+    m->staging = g->staging_bytes;
+    m->measured = g->measured_bytes;
+    m->shared_context = g->impl && !g->context_fresh && g->backend == NEURONTE_GPU_CUDA;
+    m->weights = g->v2 ? g->plan.nstatic * sizeof(float) : g->pk.nparams * sizeof(float);
+    return 0;
+}
 
 int neuronte_gpu_cell(const neuronte_gpu *g, int *w, int *h)
 {
@@ -645,6 +664,8 @@ int neuronte_gpu_coverage(neuronte_gpu *g, const uint32_t *scalars, int count, f
     int i;
     if (!g || !scalars || !out || count < 0)
         return -1;
+    if (g->v2)
+        return neuronte_gpu_v2_coverage(g, scalars, count, out, timing);
     plane = (size_t)g->cell_w * g->cell_h;
     if (g->backend == NEURONTE_GPU_CPU || g->backend == NEURONTE_GPU_CPU_FALLBACK) {
         for (i = 0; i < count; i++)

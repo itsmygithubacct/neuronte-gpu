@@ -1,0 +1,42 @@
+// neuronte-gpu: pixels of the listed glyphs from the sample buffer, for Vulkan
+// and for OpenGL 4.3. Each pixel's samples are added row by row, as the CPU
+// library adds them, then divided by their number. One invocation per pixel.
+#ifndef GL
+layout(local_size_x = 64) in;
+layout(push_constant) uniform Push {
+    int count; // glyphs of the list this dispatch takes
+    int cell_w;
+    int cell_h;
+    int S;
+    int first; // from this entry of the list
+} pc;
+#else
+layout(local_size_x = 64) in;
+struct Push {
+    int count, cell_w, cell_h, S, first;
+};
+uniform Push pc;
+#endif
+
+layout(std430, binding = 4) writeonly buffer Out { float outv[]; };
+layout(std430, binding = 6) readonly buffer Samp { float samp[]; };
+layout(std430, binding = 7) readonly buffer List { uint list[]; };
+
+void main()
+{
+    const int plane = pc.cell_w * pc.cell_h;
+    const int idx = int(gl_GlobalInvocationID.x);
+    if (idx >= pc.count * plane)
+        return;
+    const int gi = idx / plane, pi = idx - gi * plane;
+    const int g = int(list[pc.first + gi]);
+    const int py = pi / pc.cell_w, px = pi - py * pc.cell_w;
+    const int S = pc.S, sw = pc.cell_w * S;
+    const int base = g * sw * pc.cell_h * S;
+    precise float acc = 0.0;
+    for (int j = 0; j < S; j++)
+        for (int i = 0; i < S; i++)
+            acc = acc + samp[base + (py * S + j) * sw + px * S + i];
+    precise float cover = acc / float(S * S);
+    outv[g * plane + pi] = cover;
+}

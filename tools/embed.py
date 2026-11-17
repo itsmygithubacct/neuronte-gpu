@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Write a C file that embeds the compiled kernels.
 
-    embed.py OUT.c --ptx H=FILE ... --spirv EXACT=FILE ... [--opencl FILE]
+    embed.py OUT.c --ptx H=FILE ... --ptx2 KEY=FILE ... --spirv EXACT=FILE ... --glsl NAME=FILE ... [--opencl FILE]
+
+--spirv keys: 0 and 1, the single-net kernel (fast, exact); 10 and 11, the
+file-handle kernel; 20, the file handles' sample reduction. --glsl embeds
+shader text for the OpenGL backend as neuronte_gpu_glsl_NAME.
+
+--ptx2 holds the file-handle kernels: KEY is the hidden width of a narrow
+kernel, or 1000 plus the accumulators per thread of a wide one.
 
 PTX is embedded as bytes (the backend adds the terminating NUL); SPIR-V as
 32-bit words; OpenCL C as a NUL-terminated string. Any of them may be
@@ -21,7 +28,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
     ap.add_argument("--ptx", nargs="*", default=[])
+    ap.add_argument("--ptx2", nargs="*", default=[])
     ap.add_argument("--spirv", nargs="*", default=[])
+    ap.add_argument("--glsl", nargs="*", default=[])
     ap.add_argument("--opencl")
     args = ap.parse_args()
 
@@ -35,6 +44,15 @@ def main():
         lines.extend(f"    {row}," for row in byte_rows(data))
         lines.append("};")
         ptx.append((int(h), name))
+    ptx2 = []
+    for item in args.ptx2:
+        h, path = item.split("=", 1)
+        data = Path(path).read_bytes()
+        name = f"ptx2_k{int(h)}"
+        lines.append(f"static const unsigned char {name}[] = {{")
+        lines.extend(f"    {row}," for row in byte_rows(data))
+        lines.append("};")
+        ptx2.append((int(h), name))
     spirv = []
     for item in args.spirv:
         exact, path = item.split("=", 1)
@@ -54,11 +72,25 @@ def main():
     lines.append("    {0, 0, 0},")
     lines.append("};")
     lines.append(f"const int neuronte_gpu_ptx_count = {len(ptx)};")
+    lines.append("const struct embedded_ptx neuronte_gpu_ptx2[] = {")
+    lines.extend(f"    {{{h}, {name}, sizeof {name}}}," for h, name in ptx2)
+    lines.append("    {0, 0, 0},")
+    lines.append("};")
+    lines.append(f"const int neuronte_gpu_ptx2_count = {len(ptx2)};")
     lines.append("const struct embedded_spirv neuronte_gpu_spirv[] = {")
     lines.extend(f"    {{{exact}, {name}, {words}}}," for exact, name, words in spirv)
     lines.append("    {0, 0, 0},")
     lines.append("};")
     lines.append(f"const int neuronte_gpu_spirv_count = {len(spirv)};")
+    for item in args.glsl:
+        name, path = item.split("=", 1)
+        text = Path(path).read_bytes()
+        if b"\0" in text:
+            raise SystemExit(f"{path}: contains a NUL byte")
+        lines.append(f"const char neuronte_gpu_glsl_{name}[] = {{")
+        lines.extend(f"    {row}," for row in byte_rows(text))
+        lines.append("    0,")
+        lines.append("};")
     source = Path(args.opencl).read_bytes() if args.opencl else b""
     if b"\0" in source:
         raise SystemExit(f"{args.opencl}: contains a NUL byte")

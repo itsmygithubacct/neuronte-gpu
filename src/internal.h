@@ -47,7 +47,71 @@ struct backend_ops {
     void (*close)(void *impl);
     /* count <= max_batch glyphs; writes count * plane floats to out */
     int (*run)(void *impl, const uint32_t *scalars, int count, float *out, struct neuronte_gpu_timing *t);
+    /* a file handle: runs the plan in g->v2 (see below) and writes count * plane floats to out */
+    int (*run_plan)(void *impl, int count, float *out, struct neuronte_gpu_timing *t);
 };
+
+/* ---- file handles: bundles, tiled nets, drawing files, any hidden width ----
+ *
+ * A file at one cell size is a table of segments. A segment is a rectangle of
+ * the cell's sample grid drawn by one distance net: the net's weights, the
+ * rectangle, its two layer-1 position tables and its coverage slope. A plain
+ * net is one segment over the whole grid; a tiled net is one per tile. A
+ * letter whose samples are warped (a drawing file's letter edge table) gets
+ * segments of its own for the call, with tables made for its sample positions.
+ *
+ * A call turns its scalars into pairs (glyph, code), grouped by segment, and
+ * into blocks: a block is a run of pairs of one segment and a slice of their
+ * pixels or samples. Blocks are grouped by kernel (one per hidden width up
+ * to 64, one per accumulator count above), one launch per kernel present.
+ * Where tiles split a pixel, or the kernel is the wide one, samples go to a
+ * sample buffer and a last pass adds each pixel's samples in the library's
+ * order. Records below must match the kernels. */
+enum { S_PARAM, S_MASKS, S_X0, S_Y0, S_W, S_H, S_XTAB, S_YTAB, S_SLOPE, S_HID, S_INTS };
+enum { B_SEG, B_PAIR0, B_NPAIRS, B_LO, B_HI, B_MODE, B_INTS };
+/* block modes */
+enum {
+    BM_PIXEL = 0,       /* items are pixels of an aligned segment; a thread takes a pixel's samples in turn */
+    BM_PIXEL_SPLIT = 1, /* the same, a thread per sample and an ordered sum through shared memory */
+    BM_SAMPLE = 2,      /* items are samples, written to the sample buffer */
+    BM_DIRECT = 3,      /* items are samples of a 1-sample grid, written to the output */
+};
+#define NARROW_MAX 64 /* hidden widths with a kernel of their own */
+#define LANES 32      /* threads that share one sample in the wide kernel */
+
+struct v2kern {
+    int wide; /* 0: one kernel for hidden width n; 1: the wide kernel with n accumulators per thread */
+    int n;
+    int shared_floats; /* per block */
+    int threads;       /* per block */
+    int slots;         /* wide: samples a block takes per pass */
+    int hmax;          /* the widest net it draws */
+    int gp_max;        /* the most pairs a block of this kernel takes */
+    int block0, nblocks; /* this call's blocks, a run of the block table */
+};
+
+struct v2plan {
+    /* static, made at open */
+    float *params;
+    size_t nparams, nstatic, params_cap; /* floats: used, the static part, capacity */
+    int32_t *segs;
+    int nsegs, nstatic_segs, segs_cap;
+    uint32_t *masks;
+    int nmasks; /* uints */
+    struct v2kern *kern;
+    int nkern;
+    int need_samples; /* some glyph can need the sample buffer */
+    /* per call */
+    uint32_t *pairs; /* 2 per pair: glyph index in the batch, code */
+    int npairs, pairs_cap;
+    int32_t *blocks;
+    int nblocks, blocks_cap;
+    uint32_t *reduce; /* glyphs whose pixels come from the sample buffer */
+    int nreduce;
+    int dynamic; /* segments and params past the static part were made for this call */
+};
+
+struct v2;
 
 struct neuronte_gpu {
     int backend;
@@ -66,6 +130,15 @@ struct neuronte_gpu {
     const struct backend_ops *ops;
     void *impl;
     float *cpu_buf;
+    int nmembers;       /* a file handle's nets, as the library numbers them */
+    struct v2 *v2;      /* a file handle (bundle, tiled, drawing file, wide net), else NULL */
+    struct v2plan plan; /* what its backend reads */
+    int fill_wide;      /* blocks of the wide kernel a launch needs to occupy the device */
+    size_t device_bytes; /* bytes this handle allocated on the device */
+    size_t context_bytes; /* device memory the context took before any allocation of ours, 0 if unknown */
+    size_t staging_bytes; /* host memory pinned or mapped for transfers */
+    int context_fresh;    /* this handle created the device context it uses (otherwise it joined one) */
+    size_t measured_bytes; /* what the driver says the device lost between context creation and the end of open */
 };
 
 /* Backends. On failure they return nonzero, write a reason and leave
@@ -75,6 +148,20 @@ int neuronte_gpu_cuda_open(neuronte_gpu *g, const struct neuronte_gpu_options *o
 int neuronte_gpu_vulkan_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
 int neuronte_gpu_opencl_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
 
+int neuronte_gpu_cuda_open2(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
+int neuronte_gpu_vulkan_open2(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *why, size_t len);
+
+/* neuronte_gpu_v2.c */
+int neuronte_gpu_v2_wanted(const char *path, int flags);
+int neuronte_gpu_v2_open(neuronte_gpu *g, const struct neuronte_gpu_options *opt, char *reason, size_t reason_len);
+void neuronte_gpu_v2_close(neuronte_gpu *g);
+int neuronte_gpu_v2_size(neuronte_gpu *g, int narrow_threads, int wide_threads, int wide_slots, int cuda,
+                         size_t shared_max, char *why, size_t wl);
+int neuronte_gpu_v2_coverage(neuronte_gpu *g, const uint32_t *scalars, int count, float *out,
+                             struct neuronte_gpu_timing *timing);
+int neuronte_gpu_parse_net(const unsigned char *p, size_t len, struct net *n, char *why, size_t wl);
+unsigned char *neuronte_gpu_read_file(const char *path, size_t *len);
+
 /* Embedded kernels (generated at build time). */
 struct embedded_ptx {
     int h;
@@ -83,6 +170,9 @@ struct embedded_ptx {
 };
 extern const struct embedded_ptx neuronte_gpu_ptx[];
 extern const int neuronte_gpu_ptx_count;
+/* File-handle kernels: h is the hidden width, or 1000 + accumulators per thread for the wide kernel. */
+extern const struct embedded_ptx neuronte_gpu_ptx2[];
+extern const int neuronte_gpu_ptx2_count;
 
 struct embedded_spirv {
     int exact;

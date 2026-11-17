@@ -47,6 +47,8 @@ enum neuronte_gpu_flags {
     NEURONTE_GPU_SHARED_WEIGHTS = 8,   /* Vulkan: copy layers 2-4 to shared memory instead of
                                         * reading them from the parameter buffer (CUDA always
                                         * uses shared memory) */
+    NEURONTE_GPU_FILE = 16,            /* open nrt_path as a file handle even when it is one narrow
+                                        * net (any other file always is one, see below) */
 };
 
 struct neuronte_gpu_options {
@@ -73,6 +75,10 @@ struct neuronte_gpu_timing {
     uint64_t total;
     int launches;
     int cpu_glyphs;    /* glyphs evaluated by the CPU library on a GPU handle */
+    /* file handles */
+    uint64_t plan;     /* routing the scalars and laying out the launch, on the host */
+    int marks;         /* untrained marks, drawn by the library (coverage 0 or 1, no net) */
+    int warped;        /* letters drawn at positions warped by the letter edge table */
 };
 
 int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out, char *reason,
@@ -98,6 +104,57 @@ int neuronte_gpu_exact(const neuronte_gpu *g);
  * tile's position. */
 int neuronte_gpu_coverage(neuronte_gpu *g, const uint32_t *scalars, int count, float *out,
                           struct neuronte_gpu_timing *timing);
+
+/* ---- file handles ----
+ *
+ * nrt_path may name any file the reference library opens that holds a net: a
+ * bundle (its router sends each scalar to one of its nets), a tiled net, a
+ * drawing file (with or without a bundle, advances and a letter edge table),
+ * or one distance net of any hidden width up to 1,024. One narrow net (hidden
+ * width up to 64) keeps the single-net path above unless NEURONTE_GPU_FILE is
+ * given. neuronte_gpu_coverage() then returns, for each scalar, what
+ * neuronte_coverage() returns on that file at the handle's cell size and
+ * samples. Colour nets and the untrained mark are drawn by the library on
+ * the host and counted in the timing (cpu_glyphs, marks). CUDA and Vulkan
+ * draw file handles; OpenCL does not yet.
+ *
+ * The calls below mirror the library's and return -1 on a handle that is
+ * not a file handle. */
+int neuronte_gpu_route(const neuronte_gpu *g, uint32_t scalar);      /* neuronte_route */
+int neuronte_gpu_untrained(const neuronte_gpu *g, uint32_t scalar);  /* neuronte_untrained */
+int neuronte_gpu_set_untrained(neuronte_gpu *g, int mode);           /* neuronte_set_untrained */
+int neuronte_gpu_set_snap(neuronte_gpu *g, int below_px);            /* neuronte_set_snap */
+
+int neuronte_gpu_set_binary(neuronte_gpu *g, int on);                /* neuronte_set_binary */
+
+/* neuronte_draw_text() and neuronte_draw_text_stroke() for a file handle
+ * opened on a drawing file at cell em x 2 em: the same pixels, with the
+ * line's letters drawn by the GPU in one launch the first time each is
+ * seen and kept by the handle afterwards. stroke_px -1 draws as
+ * neuronte_draw_text() does with `bold`; 0 and up as
+ * neuronte_draw_text_stroke(). Returns how far the pen moved, or one of the
+ * library's error codes. `timing`, when not NULL, receives the launch's
+ * stage times (zero when every letter was kept already). */
+int neuronte_gpu_draw_text(neuronte_gpu *g, uint32_t *pixels, int stride, int width, int height, int x, int y,
+                           int bold, int stroke_px, const char *text, size_t len, uint32_t color,
+                           struct neuronte_gpu_timing *timing);
+
+/* Device memory, in bytes. buffers: what this handle allocated on the device
+ * (weights and tables, the batch's pairs and blocks, the output and, where
+ * used, the sample buffer). weights: the part of buffers that is weights and
+ * position tables. staging: host memory pinned or mapped for transfers.
+ * measured: what the driver says the device lost between this handle
+ * entering its context and the end of open (kernels and buffers, in the
+ * driver's own granularity); 0 when the driver does not say. Handles on one
+ * CUDA device share one context; shared_context is 1 for a handle that
+ * joined a context another handle had made. What a context itself takes is
+ * the process's device memory, as the driver's tools report it, less the
+ * handles' own. */
+struct neuronte_gpu_memory {
+    size_t buffers, weights, staging, measured;
+    int shared_context;
+};
+int neuronte_gpu_memory(const neuronte_gpu *g, struct neuronte_gpu_memory *m);
 
 #ifdef __cplusplus
 }

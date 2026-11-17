@@ -31,6 +31,11 @@ GLSLFLAGS ?=
 PYTHON ?= python3
 # hidden widths with a CUDA kernel (the Vulkan kernel takes any width up to 64)
 HIDDEN ?= 1 2 3 4 6 8 12 16 24 32 48 64
+# File handles (bundles, tiled nets, drawing files, wide nets): narrow hidden
+# widths with a CUDA kernel of their own, and the accumulator counts R of the
+# wide kernel, which draws hidden widths 65 to 32 R.
+HIDDEN2 ?= 1 2 3 4 6 8 12 16 20 24 32 48 56 64
+WIDE2 ?= 3 4 5 6 8 10 12 16 24 32
 
 WARN = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 # No contraction: the layer-1 tables are computed exactly as the reference library does.
@@ -39,24 +44,37 @@ CPPFLAGS += -Isrc -I$(NEURONTE_DIR)/include $(if $(VULKAN_INCLUDE),-I$(VULKAN_IN
 LDLIBS += $(NEURONTE_DIR)/build/libneuronte.a -ldl -lm -lpthread
 
 PTX = $(if $(filter 1,$(CUDA)),$(foreach h,$(HIDDEN),build/cover_h$(h).ptx))
-SPV = $(if $(filter 1,$(VULKAN)),build/cover_exact1.spv build/cover_exact0.spv)
+PTX2 = $(if $(filter 1,$(CUDA)),$(foreach h,$(HIDDEN2),build/cover2_h$(h).ptx) \
+    $(foreach r,$(WIDE2),build/cover2_r$(r).ptx))
+SPV = $(if $(filter 1,$(VULKAN)),build/cover_exact1.spv build/cover_exact0.spv \
+    build/cover2_exact1.spv build/cover2_exact0.spv build/reduce.spv)
 VK_OBJ = $(if $(filter 1,$(VULKAN)),build/backend_vulkan.o,build/backend_none.o)
-OBJS = build/neuronte_gpu.o build/backend_cuda.o $(VK_OBJ) build/backend_opencl.o build/kernels.o
+OBJS = build/neuronte_gpu.o build/neuronte_gpu_v2.o build/backend_cuda.o $(VK_OBJ) build/backend_opencl.o build/kernels.o
 
-all: build/libneuronte_gpu.a build/neuronte_gpu_bench
+all: build/libneuronte_gpu.a build/neuronte_gpu_bench build/neuronte_gpu_text build/neuronte_gpu_mem
 
 build:
 	mkdir -p build
 
 # Rebuilds the kernels when a build variable that shapes them changes.
-CONFIG = $(HIDDEN) | $(CUDA) $(PTXCC) $(PTX_ARCH) | $(VULKAN) $(GLSLFLAGS)
+CONFIG = $(HIDDEN) | $(HIDDEN2) | $(WIDE2) | $(CUDA) $(PTXCC) $(PTX_ARCH) | $(VULKAN) $(GLSLFLAGS)
 build/config.stamp: FORCE | build
 	@echo '$(CONFIG)' | cmp -s - $@ || echo '$(CONFIG)' > $@
 
 ifeq ($(PTXCC),nvcc)
 build/cover_h%.ptx: kernels/cover.cu build/config.stamp | build
 	nvcc -ptx -arch=compute_$(subst sm_,,$(PTX_ARCH)) -O3 -DNEURONTE_H=$* -o $@ $<
+build/cover2_h%.ptx: kernels/cover2.cu build/config.stamp | build
+	nvcc -ptx -arch=compute_$(subst sm_,,$(PTX_ARCH)) -O3 -DNEURONTE_H=$* -o $@ $<
+build/cover2_r%.ptx: kernels/cover2.cu build/config.stamp | build
+	nvcc -ptx -arch=compute_$(subst sm_,,$(PTX_ARCH)) -O3 -DNEURONTE_R=$* -o $@ $<
 else
+build/cover2_h%.ptx: kernels/cover2.cu build/config.stamp | build
+	$(PTXCC) -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=$(PTX_ARCH) -O3 \
+	    -DNEURONTE_H=$* -S -o $@ $<
+build/cover2_r%.ptx: kernels/cover2.cu build/config.stamp | build
+	$(PTXCC) -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=$(PTX_ARCH) -O3 \
+	    -DNEURONTE_R=$* -S -o $@ $<
 build/cover_h%.ptx: kernels/cover.cu build/config.stamp | build
 	$(PTXCC) -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=$(PTX_ARCH) -O3 \
 	    -DNEURONTE_H=$* -S -o $@ $<
@@ -64,10 +82,19 @@ endif
 
 build/cover_exact%.spv: kernels/cover.comp build/config.stamp | build
 	$(GLSLC) -fshader-stage=compute --target-env=vulkan1.1 -O $(GLSLFLAGS) -DEXACT=$* -o $@ $<
+build/cover2_exact%.spv: kernels/cover2.comp build/config.stamp | build
+	$(GLSLC) -fshader-stage=compute --target-env=vulkan1.1 -std=450core -O $(GLSLFLAGS) -DEXACT=$* -o $@ $<
+build/reduce.spv: kernels/reduce.comp build/config.stamp | build
+	$(GLSLC) -fshader-stage=compute --target-env=vulkan1.1 -std=450core -O $(GLSLFLAGS) -o $@ $<
 
-build/kernels.c: tools/embed.py $(PTX) $(SPV) kernels/cover.cl build/config.stamp | build
+build/kernels.c: tools/embed.py $(PTX) $(PTX2) $(SPV) kernels/cover.cl kernels/cover2.comp kernels/reduce.comp \
+    build/config.stamp | build
 	$(PYTHON) tools/embed.py $@ --ptx $(foreach h,$(if $(PTX),$(HIDDEN)),$(h)=build/cover_h$(h).ptx) \
-	    --spirv $(if $(SPV),1=build/cover_exact1.spv 0=build/cover_exact0.spv) --opencl kernels/cover.cl
+	    --ptx2 $(foreach h,$(if $(PTX2),$(HIDDEN2)),$(h)=build/cover2_h$(h).ptx) \
+	    $(foreach r,$(if $(PTX2),$(WIDE2)),$(shell expr 1000 + $(r))=build/cover2_r$(r).ptx) \
+	    --spirv $(if $(SPV),1=build/cover_exact1.spv 0=build/cover_exact0.spv 11=build/cover2_exact1.spv \
+	    10=build/cover2_exact0.spv 20=build/reduce.spv) \
+	    --glsl cover2=kernels/cover2.comp reduce=kernels/reduce.comp --opencl kernels/cover.cl
 
 build/%.o: src/%.c src/neuronte_gpu.h src/internal.h src/clmini.h | build
 	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -c -o $@ $<
@@ -82,8 +109,14 @@ build/libneuronte_gpu.a: $(OBJS)
 build/neuronte_gpu_bench: bench/neuronte_gpu_bench.c build/libneuronte_gpu.a | build
 	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
 
+build/neuronte_gpu_text: bench/neuronte_gpu_text.c build/libneuronte_gpu.a | build
+	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
+
+build/neuronte_gpu_mem: bench/neuronte_gpu_mem.c build/libneuronte_gpu.a | build
+	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
+
 clean:
 	rm -rf build
 
 .PHONY: all clean FORCE
-.SECONDARY: $(PTX) $(SPV)
+.SECONDARY: $(PTX) $(PTX2) $(SPV)

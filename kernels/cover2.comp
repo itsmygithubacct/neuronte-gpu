@@ -1,0 +1,200 @@
+// neuronte-gpu compute kernel for file handles (bundles, tiled nets, drawing
+// files, wide nets), for Vulkan and for OpenGL 4.3. The tables are those of
+// kernels/cover2.cu; see "file handles" in src/internal.h.
+//
+// One workgroup is one block of the block table: a run of pairs (glyph, code)
+// of one segment and a slice of their pixels or samples. The workgroup
+// computes its pairs' character parts of layer 1 into shared memory, then
+// every invocation takes one item at a time. Weights are read from the
+// parameter buffer.
+//
+// A pipeline (Vulkan) or program (OpenGL) is made per kernel of the plan:
+//   WIDE = 0: every net it draws has hidden width H; loops are unrolled.
+//   WIDE = 1: nets of hidden widths up to H, a multiple of 32; layers 2 and 3
+//             are stored by input, padded to H outputs, and are added input
+//             after input, skipping inputs ReLU set to zero, as the CPU
+//             library does.
+// Vulkan sets H, WIDE, GPMAX and the workgroup size as specialization
+// constants; OpenGL defines them, and GL, in the text put before this file.
+//
+// The file has no #version line: the Vulkan build gives the version to the
+// compiler, the OpenGL backend puts one before the text.
+//
+// EXACT (a define, two modules) keeps the CPU library's operation order with
+// separately rounded multiplies and adds: `precise` forbids contraction.
+#ifndef GL
+#extension GL_EXT_control_flow_attributes : require
+#define UNROLL [[unroll]]
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const int H = 48;
+layout(constant_id = 2) const int GPMAX = 1; // the most pairs a block takes
+layout(constant_id = 3) const int WIDE = 0;
+layout(push_constant) uniform Push {
+    int block0; // the first block of this dispatch in the block table
+    int cell_w;
+    int cell_h;
+    int S;
+} pc;
+#else
+#define UNROLL
+layout(local_size_x = NT) in;
+struct Push {
+    int block0, cell_w, cell_h, S;
+};
+uniform Push pc;
+#endif
+
+#ifndef EXACT
+#define EXACT 1
+#endif
+
+layout(std430, binding = 0) readonly buffer Params { float params[]; };
+layout(std430, binding = 1) readonly buffer Segs { int segs[]; };
+layout(std430, binding = 2) readonly buffer Masks { uint masks[]; };
+layout(std430, binding = 3) readonly buffer Pairs { uint pairs[]; };
+layout(std430, binding = 4) writeonly buffer Out { float outv[]; };
+layout(std430, binding = 5) readonly buffer Blocks { int blocks[]; };
+layout(std430, binding = 6) writeonly buffer Samp { float samp[]; };
+
+// Must match the host (src/internal.h).
+const int S_PARAM = 0, S_MASKS = 1, S_X0 = 2, S_Y0 = 3, S_W = 4, S_H = 5, S_XTAB = 6, S_YTAB = 7, S_SLOPE = 8;
+const int S_HID = 9, S_INTS = 10;
+const int B_SEG = 0, B_PAIR0 = 1, B_NPAIRS = 2, B_LO = 3, B_HI = 4, B_MODE = 5, B_INTS = 6;
+const int BM_SAMPLE = 2, BM_DIRECT = 3;
+const int CODE = 64;
+const int NBITS = 21;
+
+shared float cs[GPMAX * H];
+
+#if EXACT
+#define PRECISE precise
+#else
+#define PRECISE
+#endif
+#define MAC(acc, a, b) ((acc) + (a) * (b))
+
+// One sample's clamped value. pw: layers 2 to 4 in params; cb: the pair's character part in cs;
+// xr, yr: the sample's rows of the position tables; hid: the net's hidden width.
+float sample_value(int pw, int cb, int xr, int yr, int hid, float slope)
+{
+    float a[H], b[H];
+    PRECISE float f;
+    if (WIDE == 0) {
+        const int W2 = 0, B2 = H * H, W3 = H * H + H, B3 = 2 * H * H + H, W4 = 2 * H * H + 2 * H;
+        UNROLL for (int o = 0; o < H; o++) {
+            PRECISE float x = (cs[cb + o] + params[xr + o]) + params[yr + o];
+            a[o] = x > 0.0 ? x : 0.0;
+        }
+        UNROLL for (int o = 0; o < H; o++) {
+            PRECISE float s2 = params[pw + B2 + o];
+            UNROLL for (int q = 0; q < H; q++)
+                s2 = MAC(s2, a[q], params[pw + W2 + o * H + q]);
+            b[o] = s2 > 0.0 ? s2 : 0.0;
+        }
+        UNROLL for (int o = 0; o < H; o++) {
+            PRECISE float s3 = params[pw + B3 + o];
+            UNROLL for (int q = 0; q < H; q++)
+                s3 = MAC(s3, b[q], params[pw + W3 + o * H + q]);
+            a[o] = s3 > 0.0 ? s3 : 0.0;
+        }
+        f = params[pw + W4 + H];
+        UNROLL for (int o = 0; o < H; o++)
+            f = MAC(f, params[pw + W4 + o], a[o]);
+    } else {
+        // by input: row q, H wide, holds the weights from input q
+        const int W2 = pw, B2 = W2 + hid * H, W3 = B2 + H, B3 = W3 + hid * H, W4 = B3 + H;
+        for (int o = 0; o < hid; o++) {
+            PRECISE float x = (cs[cb + o] + params[xr + o]) + params[yr + o];
+            a[o] = x > 0.0 ? x : 0.0;
+            b[o] = params[B2 + o];
+        }
+        for (int q = 0; q < hid; q++) {
+            float aq = a[q];
+            if (aq != 0.0)
+                for (int o = 0; o < hid; o++) {
+                    PRECISE float t = MAC(b[o], aq, params[W2 + q * H + o]);
+                    b[o] = t;
+                }
+        }
+        for (int o = 0; o < hid; o++) {
+            b[o] = b[o] > 0.0 ? b[o] : 0.0;
+            a[o] = params[B3 + o];
+        }
+        for (int q = 0; q < hid; q++) {
+            float bq = b[q];
+            if (bq != 0.0)
+                for (int o = 0; o < hid; o++) {
+                    PRECISE float t = MAC(a[o], bq, params[W3 + q * H + o]);
+                    a[o] = t;
+                }
+        }
+        f = params[W4 + hid];
+        for (int o = 0; o < hid; o++) {
+            float r = a[o] > 0.0 ? a[o] : 0.0;
+            f = MAC(f, params[W4 + o], r);
+        }
+    }
+    PRECISE float v = MAC(0.5, slope, f);
+    return v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v;
+}
+
+void main()
+{
+    const int tid = int(gl_LocalInvocationID.x);
+    const int nt = int(gl_WorkGroupSize.x);
+    const int bk = (pc.block0 + int(gl_WorkGroupID.x)) * B_INTS;
+    const int sg = blocks[bk + B_SEG] * S_INTS;
+    const int pr = 2 * blocks[bk + B_PAIR0];
+    const int np = blocks[bk + B_NPAIRS], lo = blocks[bk + B_LO], hi = blocks[bk + B_HI], mode = blocks[bk + B_MODE];
+    const int p = segs[sg + S_PARAM], X = segs[sg + S_XTAB], Y = segs[sg + S_YTAB], mk = segs[sg + S_MASKS];
+    const int x0 = segs[sg + S_X0], y0 = segs[sg + S_Y0], w = segs[sg + S_W], h = segs[sg + S_H];
+    const int hid = WIDE != 0 ? segs[sg + S_HID] : H;
+    const float slope = params[segs[sg + S_SLOPE]];
+    const int pw = p + (CODE + 1) * hid;
+    const int S = pc.S;
+
+    for (int k = tid; k < np * hid; k += nt) {
+        int g = k / hid, o = k - g * hid;
+        uint s = pairs[pr + 2 * g + 1];
+        PRECISE float c = params[p + CODE * hid + o]; // b1
+        for (int i = 0; i < CODE; i++) {
+            uint bit = i < NBITS ? (s >> uint(i)) & 1u : uint(bitCount(s & masks[mk + i - NBITS]) & 1);
+            float wv = params[p + i * hid + o];
+            c = c + (bit != 0u ? wv : -wv); // (+-1) * w is exact
+        }
+        cs[k] = c;
+    }
+    barrier();
+
+    const int plane = pc.cell_w * pc.cell_h;
+    if (mode >= BM_SAMPLE) {
+        // one item is one sample of the segment, row-major
+        const int Q = w * h, sw = pc.cell_w * S, splane = sw * pc.cell_h * S;
+        for (int it = lo + tid; it < hi; it += nt) {
+            const int g = it / Q, r = it - g * Q;
+            const int sj = r / w, si = r - sj * w;
+            const float v = sample_value(pw, g * hid, X + si * hid, Y + sj * hid, hid, slope);
+            const int glyph = int(pairs[pr + 2 * g]);
+            if (mode == BM_DIRECT) {
+                PRECISE float cover = 0.0 + v;
+                outv[glyph * plane + (y0 + sj) * pc.cell_w + x0 + si] = cover;
+            } else {
+                samp[glyph * splane + (y0 + sj) * sw + x0 + si] = v;
+            }
+        }
+    } else {
+        // one item is one pixel of a segment whose rectangle is whole pixels
+        const int tw = w / S, th = h / S, P = tw * th, px0 = x0 / S, py0 = y0 / S;
+        const float ss = float(S * S);
+        for (int pix = lo + tid; pix < hi; pix += nt) {
+            const int g = pix / P, pi = pix - g * P;
+            const int py = pi / tw, px = pi - py * tw;
+            PRECISE float acc = 0.0;
+            for (int j = 0; j < S; j++)
+                for (int i = 0; i < S; i++)
+                    acc = acc + sample_value(pw, g * hid, X + (px * S + i) * hid, Y + (py * S + j) * hid, hid, slope);
+            PRECISE float cover = acc / ss;
+            outv[int(pairs[pr + 2 * g]) * plane + (py0 + py) * pc.cell_w + px0 + px] = cover;
+        }
+    }
+}

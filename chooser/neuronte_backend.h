@@ -16,9 +16,12 @@
  * such scalars and a GPU is in use, else the CPU.
  *
  * A handle is for one thread at a time, like a neuronte handle. Nothing
- * here waits for a GPU: it is opened in the background at the first call
- * that wants it, the CPU draws until it is there, and a call that is under
- * way when it arrives hands it the glyphs that are left.
+ * here waits for a GPU: it is opened in the background, the CPU draws
+ * until it is there, and a call that is under way when it arrives hands it
+ * the glyphs that are left. A closed GPU is opened only once the CPU has
+ * worked wake_ms on glyphs that were for it, so that a few glyphs now and
+ * then never wake it, and an open one is closed after idle_close_ms without
+ * a call, so that it can go back to sleep (both from backend.conf).
  *
  * Overrides: NEURONTE_BACKEND=cpu in the environment (this program), and
  * backend=cpu in setup.conf (this machine, or this user). There is no way
@@ -59,7 +62,11 @@ int neuronte_backend_open(const char *nrt_path, int cell_w, int cell_h, neuronte
  * writes. Returns 0, or the reference library's error. */
 int neuronte_backend_coverage(neuronte_backend *b, const uint32_t *scalars, int count, float *out);
 
-/* For a caller that draws a job a few glyphs at a time so as not to wait
+/* A hint, never required: a caller that never makes this call gets the same
+ * pixels, and so does one that passes a wrong count. It only changes where
+ * they are computed.
+ *
+ * For a caller that draws a job a few glyphs at a time so as not to wait
  * (a terminal's main thread): the calls that follow are parts of one job of
  * `count` glyphs, and are judged for the GPU as a call of that size would
  * be. Each call takes its glyphs off the job; 0 forgets it. Draws nothing

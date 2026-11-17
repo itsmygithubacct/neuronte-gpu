@@ -33,7 +33,10 @@
  *   backend.max_batch=1024    glyphs per GPU call
  *   backend.covered=latin1    the characters cells files hold, which are compared but left out of
  *                             the timed calls (none: time them all); latin1 where the reference
- *                             library has cells files, else none
+ *                             library has cells files, else none. They are left out at every
+ *                             size, not only at the sizes a cells file holds: this step runs
+ *                             before the step that writes the cells files (30-cells), so it
+ *                             cannot ask a file which sizes it has
  *   backend.idle_close_ms=1000  close the GPU after this long without a call (0: keep it open)
  *   backend.wake_ms=50        open a closed GPU once the CPU has worked this long on glyphs that
  *                             were for it (0: at the first such call)

@@ -88,6 +88,12 @@ struct neuronte_gpu_timing {
     int warped;        /* letters drawn at positions warped by the letter edge table */
 };
 
+/* The number of this binary interface: the options structure, the enums and
+ * the calls below. A program that loads the library at run time compares it
+ * with the one it was built for and does not use a library that differs. */
+#define NEURONTE_GPU_ABI 1
+int neuronte_gpu_abi(void);
+
 int neuronte_gpu_open(const struct neuronte_gpu_options *opt, neuronte_gpu **out, char *reason,
                       size_t reason_len);
 void neuronte_gpu_close(neuronte_gpu *g);

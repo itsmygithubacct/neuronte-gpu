@@ -1,0 +1,140 @@
+/* The chooser's rules on made-up and on measured numbers. */
+#include "../common.h"
+#include "../decide.h"
+
+static int fails, checks;
+#define OK(cond) \
+    do { \
+        checks++; \
+        if (!(cond)) { \
+            fprintf(stderr, "    FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            fails++; \
+        } \
+    } while (0)
+
+static void one(struct nb_decide_in *in, int k, int whole, const double cpu[5], double cpun)
+{
+    in->whole[k] = whole;
+    memcpy(in->cpu1[k], cpu, sizeof in->cpu1[k]);
+    in->cpun[k] = cpun;
+    if (in->nworks <= k)
+        in->nworks = k + 1;
+}
+
+static struct nb_decide_backend *gpu(struct nb_decide_in *in, const char *name, int exact, int desktop, int k, const double t[5])
+{
+    struct nb_decide_backend *b = &in->backend[in->nbackends];
+    int i;
+    for (i = 0; i < in->nbackends; i++)
+        if (!strcmp(in->backend[i].name, name))
+            b = &in->backend[i];
+    if (b == &in->backend[in->nbackends])
+        in->nbackends++;
+    snprintf(b->name, sizeof b->name, "%s", name);
+    b->exact = exact;
+    b->draws_desktop = desktop;
+    memcpy(b->gpu[k], t, sizeof b->gpu[k]);
+    return b;
+}
+
+int main(void)
+{
+    struct nb_decide_in in;
+    struct nb_decide_out out;
+
+    /* a discrete GPU that wins every call size (the Quadro RTX 3000's figures of 17 November
+     * against a loaded core): used from one glyph */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1341, (double[]){392, 400, 410, 420, 617.7}, 80);
+    gpu(&in, "cuda", 1, 0, 0, (double[]){144, 77, 74, 63, 34.9});
+    nb_decide(&in, &out);
+    OK(out.chosen == 0 && out.min_glyphs == 1 && out.single && out.burst && out.bulk && out.bulk_vs_threads);
+    OK(strstr(out.reason, "cuda") && strstr(out.reason, "17.7"));
+
+    /* a slower discrete GPU (the Quadro M2000M's figures): wins whole tables and blocks of 256,
+     * loses at 64, so it is used from 256 although it also won at 16; loses to eight threads */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1341, (double[]){354, 354, 354, 354, 354}, 88);
+    gpu(&in, "cuda", 1, 0, 0, (double[]){293, 228, 300, 258, 226});
+    nb_decide(&in, &out);
+    OK(out.chosen == 0 && out.min_glyphs == 256 && !out.single && !out.burst && out.bulk && !out.bulk_vs_threads);
+
+    /* under the margin by a hair: the CPU */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1000, (double[]){100, 100, 100, 100, 129}, 30);
+    gpu(&in, "vulkan", 1, 0, 0, (double[]){500, 300, 200, 150, 100});
+    nb_decide(&in, &out);
+    OK(out.chosen == -1 && out.min_glyphs == 0 && !out.bulk && strstr(out.reason, "the CPU is fastest"));
+    in.cpu1[0][4] = 130;
+    nb_decide(&in, &out);
+    OK(out.chosen == 0 && out.min_glyphs == 1000 && out.bulk && !out.burst);
+
+    /* a backend that differed from the CPU by one byte is never used, whatever its speed */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1000, (double[]){400, 400, 400, 400, 400}, 100);
+    gpu(&in, "cuda", 0, 0, 0, (double[]){10, 5, 4, 3, 2});
+    nb_decide(&in, &out);
+    OK(out.chosen == -1 && strstr(out.reason, "differs from the CPU"));
+    /* and an exact, slower one beside it is */
+    gpu(&in, "vulkan", 1, 0, 0, (double[]){900, 300, 200, 150, 100});
+    nb_decide(&in, &out);
+    OK(out.chosen == 1 && out.min_glyphs == 16 && !out.single && out.burst);
+
+    /* a GPU that also draws the desktop: whole tables only, and only at twice one thread */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1341, (double[]){300, 300, 300, 300, 300}, 80);
+    gpu(&in, "vulkan", 1, 1, 0, (double[]){100, 100, 100, 100, 160});
+    nb_decide(&in, &out);
+    OK(out.chosen == -1);
+    in.backend[0].gpu[0][4] = 145;
+    nb_decide(&in, &out);
+    OK(out.chosen == 0 && out.min_glyphs == 1341 && !out.single && !out.burst && out.bulk);
+
+    /* two works: the GPU must win on both, and the smaller whole table sets the threshold */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1341, (double[]){300, 300, 300, 300, 300}, 80);
+    one(&in, 1, 600, (double[]){900, 900, 900, 900, 900}, 240);
+    gpu(&in, "cuda", 1, 0, 0, (double[]){400, 400, 400, 400, 100});
+    gpu(&in, "cuda", 1, 0, 1, (double[]){800, 800, 800, 800, 800});
+    nb_decide(&in, &out);
+    OK(out.chosen == -1);
+    in.backend[0].gpu[1][4] = 300;
+    nb_decide(&in, &out);
+    OK(out.chosen == 0 && out.min_glyphs == 600);
+
+    /* of two that win, the one used from the smaller call; at a tie, the faster on a table */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1000, (double[]){400, 400, 400, 400, 400}, 100);
+    gpu(&in, "cuda", 1, 0, 0, (double[]){500, 100, 100, 100, 20});
+    gpu(&in, "vulkan", 1, 0, 0, (double[]){200, 150, 150, 150, 50});
+    nb_decide(&in, &out);
+    OK(out.chosen == 1 && out.min_glyphs == 1);
+    in.backend[1].gpu[0][0] = 500;
+    nb_decide(&in, &out);
+    OK(out.chosen == 0 && out.min_glyphs == 16);
+
+    /* nothing answered */
+    memset(&in, 0, sizeof in);
+    in.margin = 1.3;
+    in.desktop_margin = 2;
+    one(&in, 0, 1000, (double[]){400, 400, 400, 400, 400}, 100);
+    nb_decide(&in, &out);
+    OK(out.chosen == -1 && strstr(out.reason, "no GPU backend answered"));
+
+    printf("test_decide: %d checks, %d failed\n", checks, fails);
+    return fails != 0;
+}

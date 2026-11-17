@@ -36,6 +36,11 @@ uint64_t neuronte_gpu_now(void)
     return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
 }
 
+int neuronte_gpu_abi(void)
+{
+    return NEURONTE_GPU_ABI;
+}
+
 const char *neuronte_gpu_backend_name(int backend)
 {
     switch (backend) {

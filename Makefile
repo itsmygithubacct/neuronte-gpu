@@ -147,3 +147,7 @@ clean:
 
 .PHONY: all clean FORCE
 .SECONDARY: $(PTX) $(PTX2) $(SPV)
+
+# The backend chooser (chooser/README.md): the loader library for programs
+# and the two steps of Neuronte's setup. make chooser, make test-chooser.
+include chooser/chooser.mk

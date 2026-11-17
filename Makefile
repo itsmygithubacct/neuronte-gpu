@@ -52,7 +52,7 @@ SPV = $(if $(filter 1,$(VULKAN)),build/cover_exact1.spv build/cover_exact0.spv \
 VK_OBJ = $(if $(filter 1,$(VULKAN)),build/backend_vulkan.o,build/backend_none.o)
 OBJS = build/neuronte_gpu.o build/neuronte_gpu_v2.o build/backend_cuda.o $(VK_OBJ) build/backend_opencl.o build/backend_gl.o build/kernels.o
 
-all: build/libneuronte_gpu.a build/neuronte_gpu_bench build/neuronte_gpu_text build/neuronte_gpu_mem
+all: build/libneuronte_gpu.a build/neuronte_gpu_bench build/neuronte_gpu_text build/neuronte_gpu_mem build/neuronte_gpu_soak build/neuronte_colour_cost
 
 build:
 	mkdir -p build
@@ -129,6 +129,12 @@ build/neuronte_gpu_text: bench/neuronte_gpu_text.c build/libneuronte_gpu.a | bui
 	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
 
 build/neuronte_gpu_mem: bench/neuronte_gpu_mem.c build/libneuronte_gpu.a | build
+	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
+
+build/neuronte_gpu_soak: bench/neuronte_gpu_soak.c build/libneuronte_gpu.a | build
+	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
+
+build/neuronte_colour_cost: bench/neuronte_colour_cost.c build/libneuronte_gpu.a | build
 	$(CC) $(CPPFLAGS) $(BASE) $(CFLAGS) $(WARN) -o $@ $< build/libneuronte_gpu.a $(LDLIBS)
 
 # The atlas comparison stands in for a terminal that draws with OpenGL; it needs the EGL and

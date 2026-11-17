@@ -365,7 +365,8 @@ int main(int argc, char **argv)
         struct neuronte_gpu_options opt = {0};
         struct neuronte_gpu_memory mem = {0};
         uint64_t open_ns, first_ns, all[64], frame[64];
-        int same = -1;
+        int same = -1, worst = 0;
+        size_t differing = 0, first_differing = 0;
         {
             /* the path is run when its name is one of the comma-separated words */
             const char *q = paths;
@@ -444,15 +445,26 @@ int main(int argc, char **argv)
             reference = malloc(atlas_bytes);
             memcpy(reference, got, atlas_bytes);
         } else if (reference) {
+            size_t b;
             same = memcmp(reference, got, atlas_bytes) == 0;
+            for (b = 0; b < atlas_bytes; b++)
+                if (reference[b] != got[b]) {
+                    int d = abs((int)reference[b] - (int)got[b]);
+                    if (!differing++)
+                        first_differing = b;
+                    if (d > worst)
+                        worst = d;
+                }
         }
         printf("{\"path\":\"%s\",\"backend\":\"%s\",\"device\":\"%s\",\"open_ns\":%llu,\"first_glyph_ns\":%llu,"
                "\"all_glyphs_ns\":%llu,\"per_glyph_ns\":%llu,\"frame_with_all_new_ns\":%llu,"
-               "\"atlas_equals_cpu\":%s,\"buffers\":%zu,\"weights\":%zu,\"gl_error\":%u}\n",
+               "\"atlas_equals_cpu\":%s,\"differing_bytes\":%zu,\"largest_difference\":%d,\"first_differing_byte\":%zu,"
+               "\"atlas_bytes\":%zu,\"buffers\":%zu,\"weights\":%zu,\"gl_error\":%u}\n",
                path_name[kind], p.gpu ? neuronte_gpu_backend_name(neuronte_gpu_backend(p.gpu)) : "cpu-library",
                p.gpu ? neuronte_gpu_device(p.gpu) : "", (unsigned long long)open_ns, (unsigned long long)first_ns,
                (unsigned long long)median(all, repeats), (unsigned long long)(median(all, repeats) / (uint64_t)count),
-               (unsigned long long)median(frame, repeats), same < 0 ? "null" : same ? "true" : "false", mem.buffers,
+               (unsigned long long)median(frame, repeats), same < 0 ? "null" : same ? "true" : "false", differing, worst,
+               first_differing, (size_t)atlas_bytes, mem.buffers,
                mem.weights, glGetError());
         fflush(stdout);
         if (p.gpu)
